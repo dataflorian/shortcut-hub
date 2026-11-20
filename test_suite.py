@@ -218,17 +218,21 @@ Shortcuts:
         self.assertEqual(items[0]["description"], "Launches ArXiv query")
 
     def test_04_manual_crud_hide_restore_and_sync_pipeline(self) -> None:
-        # Add manual shortcut
+        # Add manual shortcut with optional live action binding
         added = store.add_manual_shortcut(
             self.project_dir,
             category="My Workflows",
             keys="Ctrl+Alt+N",
             name="Quick Scratchpad",
             description="Opens scratchpad note",
+            action_type="open",
+            action_target="notepad.exe",
         )
         self.assertTrue(added["id"].startswith("manual::"))
+        self.assertEqual(added.get("action_type"), "open")
+        self.assertEqual(added.get("action_target"), "notepad.exe")
 
-        # Edit manual shortcut
+        # Edit manual shortcut and action binding
         updated = store.update_manual_shortcut(
             self.project_dir,
             added["id"],
@@ -236,8 +240,12 @@ Shortcuts:
             keys="Ctrl+Alt+M",
             name="Quick Scratchpad v2",
             description="Updated",
+            action_type="command",
+            action_target="Write-Output ok",
         )
         self.assertEqual(updated["keys"], "Ctrl+Alt+M")
+        self.assertEqual(updated.get("action_type"), "command")
+        self.assertEqual(updated.get("action_target"), "Write-Output ok")
 
         # Hide one Windows shortcut
         cat = store.get_catalog(

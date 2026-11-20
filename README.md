@@ -10,7 +10,7 @@
 [![Built with Rust](https://img.shields.io/badge/Built%20with-Rust%20%2B%20egui-F9E2AF?style=for-the-badge&logo=rust)](native/Cargo.toml)
 [![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011%20(x64)-CBA6F7?style=for-the-badge)](https://github.com/dataflorian/shortcut-hub/releases)
 
-[Features](#features) &bull; [Benchmarks](#performance) &bull; [Installation](#installation) &bull; [Usage](#usage) &bull; [Auto-Discovery](#automatic-shortcut-discovery) &bull; [Configuration](#configuration) &bull; [Architecture](#architecture)
+[Features](#features) &bull; [Benchmarks](#performance) &bull; [Installation](#installation) &bull; [Usage](#usage) &bull; [Auto-Discovery](#automatic-shortcut-discovery) &bull; [Configuration](#configuration) &bull; [Roadmap](ROADMAP.md)
 
 <br/>
 
@@ -23,11 +23,18 @@
 ## Features
 
 - **Instant Global Open & Close (`Ctrl+Alt+K` / `Win+F7`)** — Always-resident single-instance Windows tray daemon backed by Win32 `RegisterHotKey` (`MOD_NOREPEAT`), a `WH_KEYBOARD_LL` fallback, and focused `egui` input handling unified with an atomic 180 ms debounce guard. Press `Ctrl+Alt+K` (or `Win+F7`) from any app to open it, and press it again—or hit `Esc`—to close immediately.
-- **GPU-Accelerated Native Rust UI** — Built with [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe) / `egui 0.37` (`glow` OpenGL backend) in a single ~6.5 MB release binary with zero Electron/WebView runtime bloat and crisp HiDPI keycap rendering.
+- **In-UI Hotkey Configuration with Live Hot-Reload** — Click **`Hotkeys`** in the header to reassign Primary and Alternate toggle shortcuts via **`Record`**, **`Clear`**, **`Reset Defaults`**, or direct text entry. Changes save to `config.local.json` and take effect immediately without restarting.
+- **Actionable Custom Hotkeys** — When adding or editing a manual shortcut via **`+ Add Shortcut`**, keep it **Reference Only** or attach a live global trigger (**`Open App / URL`** via `ShellExecuteW` or **`Run Command`** via hidden PowerShell), marked with a **`Live`** badge.
+- **GPU-Accelerated Native Rust UI** — Built with [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe) / `egui 0.37` (`glow` OpenGL backend) in a single ~6.6 MB release binary with zero Electron/WebView runtime bloat and crisp HiDPI keycap rendering.
 - **Zero-Dependency Windows Catalog Included** — Ships with a built-in curated Windows 10/11 shortcut catalog out of the box, and automatically upgrades to the full native Windows manifest when Microsoft PowerToys is installed.
 - **Automatic Shortcut Discovery** — Scans Windows Startup `.ahk` / `.lnk` scripts, configured automation folders, enabled PowerToys modules, CopyQ global/window commands, and VS Code / Cursor / Antigravity `keybindings.json`.
-- **Add, Edit, Hide & Restore** — Add custom shortcuts into any existing or brand-new category using the built-in live **Record** key listener, hide noisy default Windows shortcuts you never use, and restore individual items or **Restore Windows** anytime.
 - **Two-Way PowerToys Shortcut Guide Sync** — Keeps PowerToys `+Custom.MyShortcuts.en-US.yml` and filtered `+WindowsNT.Shell.en-US.yml` synchronized (backing up your original shell manifest before first modification and rebuilding the PowerToys search index automatically).
+
+<div align="center">
+<img src="docs/assets/screenshot-hotkeys.png" alt="Shortcut Hub In-UI Configure Hotkeys Modal with Live Record & Hot-Reload" width="900"/>
+</div>
+
+<br/>
 
 <div align="center">
 <img src="docs/assets/screenshot-search.png" alt="Shortcut Hub Live Multi-Token Search Filtering" width="900"/>
@@ -37,12 +44,12 @@
 
 ## Performance
 
-Measured on Windows 11 (`x86_64`, `200%` DPI scale, release binary `6.5 MB` with LTO):
+Measured on Windows 11 (`x86_64`, `200%` DPI scale, release binary `6.6 MB` with LTO):
 
 | Operation | Measured Result | Notes |
 | --- | --- | --- |
-| Full catalog load (`117` items) | **`0.43 ms`** | Pure Rust YAML + JSON parser (`--bench`, 50-run avg) |
-| Multi-token search filter (`117` items) | **`31.4 µs`** | Zero heap-thrashing per keystroke (`--bench`, 1,000-run avg) |
+| Full catalog load (`118` items) | **`0.48 ms`** | Pure Rust YAML + JSON parser (`--bench`, 50-run avg) |
+| Multi-token search filter (`118` items) | **`31.0 µs`** | Zero heap-thrashing per keystroke (`--bench`, 1,000-run avg) |
 | Toggle latency | **Near-instant** | Already resident in tray; no cold process launch |
 | Idle memory & CPU | **~0% idle CPU** | Repaints on demand; Win32 event + hotkey threads sleep until signaled |
 
@@ -94,8 +101,9 @@ cd ..
 | **`Esc`** | Clear the search bar if non-empty, or close the overlay / modal |
 | **Type anywhere** | Live multi-token search across keystrokes, names, descriptions, and categories |
 | **Category chips** | One-click filter (`All`, `Custom & Auto`, custom categories, `PowerToys`, `Windows`, `Hidden / Restore`) |
-| **`+ Add Shortcut`** | Create a custom shortcut with category presets and live **`Record`** key capture |
-| **`Edit` / `Del` / `Hide`** | Modify manual entries or hide/restore any shortcut across Shortcut Hub and PowerToys |
+| **`+ Add Shortcut`** | Create a custom shortcut (Reference Only or live **`Open App / URL`** / **`Run Command`** binding) with **`Record`** key capture |
+| **`Hotkeys`** | Reassign Primary & Alternate toggle hotkeys in-UI with live Win32 hot-reload (no restart) |
+| **`Edit` / `Del` / `Hide`** | Modify manual entries or hide/restore any shortcut across Shortcut Hub, live bindings, and PowerToys |
 | **`Auto-Scan`** | Re-scan Startup, automation folders, CopyQ, VS Code/Cursor/Antigravity, and PowerToys |
 | **System tray icon** | Left-click to toggle; right-click for Toggle, Auto-Scan, Open Folder, and Quit |
 
@@ -108,7 +116,7 @@ cd ..
 | `--project-dir <path>` | Override folder containing `config.json` and `state/` |
 | `--bench` | Benchmark catalog loading (`ms`) and live filtering (`µs`) and exit |
 | `--smoke-test` | Open GPU viewport, verify catalog & DPI scale, print diagnostics, and exit |
-| `--screenshot <out.png>` | Render overlay and export a full-resolution RGBA PNG screenshot (`--filter`, `--search` supported) |
+| `--screenshot <out.png>` | Render overlay and export a full-resolution RGBA PNG screenshot (`--filter`, `--search`, `--open-hotkeys` supported) |
 
 </details>
 
@@ -194,6 +202,10 @@ Stop Shortcut Hub and remove the Startup shortcut cleanly:
 ```
 
 ---
+
+## Roadmap
+
+See [`ROADMAP.md`](ROADMAP.md) for future ideas and implementation blueprints (per-app scoped hotkeys, key remapping & multi-step macros, two-way IDE/PowerToys config patching, and sharable shortcut packs).
 
 ## Contributing
 

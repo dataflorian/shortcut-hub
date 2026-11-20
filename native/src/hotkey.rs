@@ -1,9 +1,14 @@
-//! Win32 RegisterHotKey primary handler, WH_KEYBOARD_LL fallback, single-instance IPC, and focus helpers.
+//! Win32 RegisterHotKey primary handler, WH_KEYBOARD_LL fallback, live hot-reload, actions, single-instance IPC, and focus helpers.
 
 use eframe::egui;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, OnceLock};
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
@@ -22,12 +27,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
     VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, FindWindowW, GetCursorPos, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, SetForegroundWindow, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetForegroundWindow,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    PM_NOREMOVE, SW_SHOWNORMAL, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_USER,
 };
+
+const WM_RELOAD_HOTKEYS: u32 = WM_USER + 1;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -38,11 +47,12 @@ pub enum UiCommand {
     Rescan,
     OpenFolder,
     SyncFinished(bool, String),
+    HotkeysReloaded(bool, String),
     Quit,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeySpec {
     pub ctrl: bool,
     pub alt: bool,
@@ -50,6 +60,50 @@ pub struct HotkeySpec {
     pub win: bool,
     pub vk: u32,
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyAction {
+    ToggleOverlay,
+    OpenTarget(String),
+    RunCommand(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct HotkeyBinding {
+    pub spec: HotkeySpec,
+    pub action: HotkeyAction,
+    pub name: String,
+}
+
+#[derive(Clone)]
+pub struct HotkeyController {
+    thread_id: Arc<AtomicU32>,
+    desired: Arc<Mutex<Vec<HotkeyBinding>>>,
+    announce_next: Arc<AtomicBool>,
+}
+
+impl HotkeyController {
+    fn reload_internal(&self, bindings: Vec<HotkeyBinding>, announce: bool) {
+        if let Ok(mut guard) = self.desired.lock() {
+            *guard = bindings;
+        }
+        self.announce_next.store(announce, Ordering::Release);
+        let tid = self.thread_id.load(Ordering::Acquire);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_RELOAD_HOTKEYS, 0, 0);
+            }
+        }
+    }
+
+    pub fn reload(&self, bindings: Vec<HotkeyBinding>) {
+        self.reload_internal(bindings, true);
+    }
+
+    pub fn pause_for_recording(&self) {
+        self.reload_internal(Vec::new(), false);
+    }
 }
 
 pub struct SendHandle(pub usize);
@@ -63,6 +117,7 @@ pub enum SingleInstanceOutcome {
 }
 
 static LAST_TOGGLE_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_ACTION_MS: AtomicU64 = AtomicU64::new(0);
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -71,15 +126,14 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Atomically claims a toggle slot if at least `min_interval_ms` elapsed since the previous toggle.
-pub fn try_claim_toggle_debounce(min_interval_ms: u64) -> bool {
+fn try_claim_debounce(slot: &AtomicU64, min_interval_ms: u64) -> bool {
     let now = now_epoch_ms();
     loop {
-        let prev = LAST_TOGGLE_MS.load(Ordering::Acquire);
+        let prev = slot.load(Ordering::Acquire);
         if now.saturating_sub(prev) < min_interval_ms {
             return false;
         }
-        if LAST_TOGGLE_MS
+        if slot
             .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
@@ -88,7 +142,12 @@ pub fn try_claim_toggle_debounce(min_interval_ms: u64) -> bool {
     }
 }
 
-fn wide_null(s: &str) -> Vec<u16> {
+/// Atomically claims a toggle slot if at least `min_interval_ms` elapsed since the previous toggle.
+pub fn try_claim_toggle_debounce(min_interval_ms: u64) -> bool {
+    try_claim_debounce(&LAST_TOGGLE_MS, min_interval_ms)
+}
+
+pub fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -165,14 +224,154 @@ fn map_vk_name(key: &str) -> Option<u32> {
         "insert" | "ins" => Some(0x2D),
         "home" => Some(0x24),
         "end" => Some(0x23),
-        "pgup" | "pageup" => Some(0x21),
-        "pgdn" | "pagedown" => Some(0x22),
-        "up" => Some(0x26),
-        "down" => Some(0x28),
-        "left" => Some(0x25),
-        "right" => Some(0x27),
+        "pgup" | "pageup" | "page up" => Some(0x21),
+        "pgdn" | "pagedown" | "page down" => Some(0x22),
+        "up" | "arrowup" => Some(0x26),
+        "down" | "arrowdown" => Some(0x28),
+        "left" | "arrowleft" => Some(0x25),
+        "right" | "arrowright" => Some(0x27),
         _ => None,
     }
+}
+
+pub fn vk_to_display_name(vk: u32) -> String {
+    match vk {
+        0x30..=0x39 => ((vk as u8) as char).to_string(),
+        0x41..=0x5A => ((vk as u8) as char).to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x20 => "Space".to_string(),
+        0x0D => "Enter".to_string(),
+        0x09 => "Tab".to_string(),
+        0x1B => "Esc".to_string(),
+        0x08 => "Backspace".to_string(),
+        0x2E => "Delete".to_string(),
+        0x2D => "Insert".to_string(),
+        0x24 => "Home".to_string(),
+        0x23 => "End".to_string(),
+        0x21 => "Page Up".to_string(),
+        0x22 => "Page Down".to_string(),
+        0x26 => "Up".to_string(),
+        0x28 => "Down".to_string(),
+        0x25 => "Left".to_string(),
+        0x27 => "Right".to_string(),
+        other => format!("VK_{other}"),
+    }
+}
+
+fn vk_to_ahk_key_token(vk: u32) -> String {
+    match vk {
+        0x30..=0x39 => ((vk as u8) as char).to_string(),
+        0x41..=0x5A => ((vk as u8) as char).to_ascii_lowercase().to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        0x20 => "Space".to_string(),
+        0x0D => "Enter".to_string(),
+        0x09 => "Tab".to_string(),
+        0x1B => "Esc".to_string(),
+        0x08 => "Backspace".to_string(),
+        0x2E => "Delete".to_string(),
+        0x2D => "Insert".to_string(),
+        0x24 => "Home".to_string(),
+        0x23 => "End".to_string(),
+        0x21 => "PgUp".to_string(),
+        0x22 => "PgDn".to_string(),
+        0x26 => "Up".to_string(),
+        0x28 => "Down".to_string(),
+        0x25 => "Left".to_string(),
+        0x27 => "Right".to_string(),
+        other => format!("vk{other:X}"),
+    }
+}
+
+pub fn spec_to_display(spec: &HotkeySpec) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if spec.win {
+        parts.push("Win".to_string());
+    }
+    if spec.ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if spec.alt {
+        parts.push("Alt".to_string());
+    }
+    if spec.shift {
+        parts.push("Shift".to_string());
+    }
+    parts.push(vk_to_display_name(spec.vk));
+    parts.join("+")
+}
+
+pub fn spec_to_ahk(spec: &HotkeySpec) -> String {
+    let mut out = String::new();
+    if spec.win {
+        out.push('#');
+    }
+    if spec.ctrl {
+        out.push('^');
+    }
+    if spec.alt {
+        out.push('!');
+    }
+    if spec.shift {
+        out.push('+');
+    }
+    out.push_str(&vk_to_ahk_key_token(spec.vk));
+    out
+}
+
+pub fn parse_display_hotkey(raw: &str) -> Option<HotkeySpec> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if !s.contains('+') && s.starts_with(['^', '!', '+', '#', '$']) {
+        return parse_ahk_hotkey(s, s);
+    }
+
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut win = false;
+    let mut key_vk: Option<u32> = None;
+
+    for token in s.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+        match token.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "menu" => alt = true,
+            "shift" => shift = true,
+            "win" | "super" | "meta" | "windows" => win = true,
+            _ => {
+                if key_vk.is_some() {
+                    return None;
+                }
+                key_vk = map_vk_name(token);
+                key_vk?;
+            }
+        }
+    }
+
+    let vk = key_vk?;
+    let mut spec = HotkeySpec {
+        ctrl,
+        alt,
+        shift,
+        win,
+        vk,
+        label: String::new(),
+    };
+    spec.label = spec_to_display(&spec);
+    Some(spec)
+}
+
+pub fn validate_hotkey_spec(spec: &HotkeySpec) -> Result<(), String> {
+    let has_mod = spec.ctrl || spec.alt || spec.shift || spec.win;
+    if spec.vk == 0x1B && !has_mod {
+        return Err("Bare Escape cannot be assigned as a global hotkey.".to_string());
+    }
+    let is_fn_key = (0x70..=0x87).contains(&spec.vk);
+    if !has_mod && !is_fn_key {
+        return Err("Global hotkeys require at least one modifier (Ctrl, Alt, Shift, or Win) or an F1-F24 key.".to_string());
+    }
+    Ok(())
 }
 
 fn vk_to_egui_key(vk: u32) -> Option<egui::Key> {
@@ -256,6 +455,93 @@ fn vk_to_egui_key(vk: u32) -> Option<egui::Key> {
     }
 }
 
+/// Maps an `egui::Key` back to its canonical Win32 VK display token for key recording.
+pub fn egui_key_to_display_name(key: egui::Key) -> Option<&'static str> {
+    match key {
+        egui::Key::Num0 => Some("0"),
+        egui::Key::Num1 => Some("1"),
+        egui::Key::Num2 => Some("2"),
+        egui::Key::Num3 => Some("3"),
+        egui::Key::Num4 => Some("4"),
+        egui::Key::Num5 => Some("5"),
+        egui::Key::Num6 => Some("6"),
+        egui::Key::Num7 => Some("7"),
+        egui::Key::Num8 => Some("8"),
+        egui::Key::Num9 => Some("9"),
+        egui::Key::A => Some("A"),
+        egui::Key::B => Some("B"),
+        egui::Key::C => Some("C"),
+        egui::Key::D => Some("D"),
+        egui::Key::E => Some("E"),
+        egui::Key::F => Some("F"),
+        egui::Key::G => Some("G"),
+        egui::Key::H => Some("H"),
+        egui::Key::I => Some("I"),
+        egui::Key::J => Some("J"),
+        egui::Key::K => Some("K"),
+        egui::Key::L => Some("L"),
+        egui::Key::M => Some("M"),
+        egui::Key::N => Some("N"),
+        egui::Key::O => Some("O"),
+        egui::Key::P => Some("P"),
+        egui::Key::Q => Some("Q"),
+        egui::Key::R => Some("R"),
+        egui::Key::S => Some("S"),
+        egui::Key::T => Some("T"),
+        egui::Key::U => Some("U"),
+        egui::Key::V => Some("V"),
+        egui::Key::W => Some("W"),
+        egui::Key::X => Some("X"),
+        egui::Key::Y => Some("Y"),
+        egui::Key::Z => Some("Z"),
+        egui::Key::F1 => Some("F1"),
+        egui::Key::F2 => Some("F2"),
+        egui::Key::F3 => Some("F3"),
+        egui::Key::F4 => Some("F4"),
+        egui::Key::F5 => Some("F5"),
+        egui::Key::F6 => Some("F6"),
+        egui::Key::F7 => Some("F7"),
+        egui::Key::F8 => Some("F8"),
+        egui::Key::F9 => Some("F9"),
+        egui::Key::F10 => Some("F10"),
+        egui::Key::F11 => Some("F11"),
+        egui::Key::F12 => Some("F12"),
+        egui::Key::F13 => Some("F13"),
+        egui::Key::F14 => Some("F14"),
+        egui::Key::F15 => Some("F15"),
+        egui::Key::F16 => Some("F16"),
+        egui::Key::F17 => Some("F17"),
+        egui::Key::F18 => Some("F18"),
+        egui::Key::F19 => Some("F19"),
+        egui::Key::F20 => Some("F20"),
+        egui::Key::F21 => Some("F21"),
+        egui::Key::F22 => Some("F22"),
+        egui::Key::F23 => Some("F23"),
+        egui::Key::F24 => Some("F24"),
+        egui::Key::Space => Some("Space"),
+        egui::Key::Enter => Some("Enter"),
+        egui::Key::Tab => Some("Tab"),
+        egui::Key::Escape => Some("Esc"),
+        egui::Key::Backspace => Some("Backspace"),
+        egui::Key::Delete => Some("Delete"),
+        egui::Key::Insert => Some("Insert"),
+        egui::Key::Home => Some("Home"),
+        egui::Key::End => Some("End"),
+        egui::Key::PageUp => Some("Page Up"),
+        egui::Key::PageDown => Some("Page Down"),
+        egui::Key::ArrowUp => Some("Up"),
+        egui::Key::ArrowDown => Some("Down"),
+        egui::Key::ArrowLeft => Some("Left"),
+        egui::Key::ArrowRight => Some("Right"),
+        _ => None,
+    }
+}
+
+/// Checks if the Win key is physically down via Win32 async key state.
+pub fn is_win_key_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 }
+}
+
 /// Checks if the given hotkey was pressed inside the focused egui frame with matching modifiers.
 pub fn matches_egui_hotkey(input: &egui::InputState, spec: &HotkeySpec) -> bool {
     let Some(egui_key) = vk_to_egui_key(spec.vk) else {
@@ -264,8 +550,7 @@ pub fn matches_egui_hotkey(input: &egui::InputState, spec: &HotkeySpec) -> bool 
     if !input.key_pressed(egui_key) {
         return false;
     }
-    let win_down =
-        unsafe { GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0 };
+    let win_down = is_win_key_down();
     input.modifiers.ctrl == spec.ctrl
         && input.modifiers.alt == spec.alt
         && input.modifiers.shift == spec.shift
@@ -306,18 +591,24 @@ pub fn parse_ahk_hotkey(raw: &str, label: &str) -> Option<HotkeySpec> {
         }
     }
     let vk = map_vk_name(&s[idx..])?;
-    Some(HotkeySpec {
+    let mut spec = HotkeySpec {
         ctrl,
         alt,
         shift,
         win,
         vk,
-        label: label.to_string(),
-    })
+        label: String::new(),
+    };
+    spec.label = if label.trim().is_empty() {
+        spec_to_display(&spec)
+    } else {
+        label.to_string()
+    };
+    Some(spec)
 }
 
 struct HookShared {
-    hotkeys: Vec<HotkeySpec>,
+    hotkeys: Mutex<Vec<HotkeyBinding>>,
     tx: mpsc::Sender<UiCommand>,
     ctx: egui::Context,
     pressed_vk: AtomicU32,
@@ -389,6 +680,51 @@ unsafe fn send_mask_key_vk_e8() {
     SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
 }
 
+pub fn execute_hotkey_action(action: HotkeyAction) {
+    match action {
+        HotkeyAction::ToggleOverlay => {}
+        HotkeyAction::OpenTarget(target) => {
+            std::thread::spawn(move || unsafe {
+                let verb = wide_null("open");
+                let file = wide_null(&target);
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    verb.as_ptr(),
+                    file.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    SW_SHOWNORMAL,
+                );
+            });
+        }
+        HotkeyAction::RunCommand(cmd) => {
+            std::thread::spawn(move || {
+                let mut child = Command::new("powershell.exe");
+                child.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &cmd]);
+                #[cfg(windows)]
+                child.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                let _ = child.spawn();
+            });
+        }
+    }
+}
+
+fn dispatch_binding(binding: &HotkeyBinding, tx: &mpsc::Sender<UiCommand>, ctx: &egui::Context) {
+    match &binding.action {
+        HotkeyAction::ToggleOverlay => {
+            if try_claim_toggle_debounce(180) {
+                let _ = tx.send(UiCommand::Toggle);
+                ctx.request_repaint();
+            }
+        }
+        HotkeyAction::OpenTarget(_) | HotkeyAction::RunCommand(_) => {
+            if try_claim_debounce(&LAST_ACTION_MS, 220) {
+                execute_hotkey_action(binding.action.clone());
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         if let Some(shared) = HOOK_STATE.get() {
@@ -421,13 +757,20 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                         || GetAsyncKeyState(VK_LWIN as i32) < 0
                         || GetAsyncKeyState(VK_RWIN as i32) < 0;
 
-                    if let Some(matched) = shared.hotkeys.iter().find(|spec| {
-                        spec.vk == kb.vkCode
-                            && spec.ctrl == ctrl
-                            && spec.alt == alt
-                            && spec.shift == shift
-                            && spec.win == win
-                    }) {
+                    let matched = shared.hotkeys.try_lock().ok().and_then(|bindings| {
+                        bindings
+                            .iter()
+                            .find(|b| {
+                                b.spec.vk == kb.vkCode
+                                    && b.spec.ctrl == ctrl
+                                    && b.spec.alt == alt
+                                    && b.spec.shift == shift
+                                    && b.spec.win == win
+                            })
+                            .cloned()
+                    });
+
+                    if let Some(binding) = matched {
                         let now = now_epoch_ms();
                         let prev_vk = shared.pressed_vk.load(Ordering::Relaxed);
                         let prev_ms = shared.last_pressed_ms.load(Ordering::Relaxed);
@@ -438,15 +781,10 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                         shared.pressed_vk.store(kb.vkCode, Ordering::Relaxed);
                         shared.last_pressed_ms.store(now, Ordering::Relaxed);
 
-                        if !try_claim_toggle_debounce(180) {
-                            return 1;
-                        }
-
-                        if matched.win {
+                        if binding.spec.win {
                             send_mask_key_vk_e8();
                         }
-                        let _ = shared.tx.send(UiCommand::Toggle);
-                        shared.ctx.request_repaint();
+                        dispatch_binding(&binding, &shared.tx, &shared.ctx);
                         return 1;
                     }
                 }
@@ -473,74 +811,168 @@ fn win32_modifiers_for_spec(spec: &HotkeySpec) -> u32 {
     mods
 }
 
-pub fn spawn_global_hotkeys(
-    hotkeys: Vec<HotkeySpec>,
-    tx: mpsc::Sender<UiCommand>,
-    ctx: egui::Context,
-) {
-    if hotkeys.is_empty() {
-        return;
+unsafe fn apply_bindings(
+    desired: &Arc<Mutex<Vec<HotkeyBinding>>>,
+    registered_map: &mut HashMap<i32, HotkeyBinding>,
+    hook_handle: &mut HHOOK,
+    tx: &mpsc::Sender<UiCommand>,
+    ctx: &egui::Context,
+) -> (usize, Vec<String>) {
+    for (id, _) in registered_map.drain() {
+        UnregisterHotKey(std::ptr::null_mut(), id);
+    }
+    if !hook_handle.is_null() {
+        UnhookWindowsHookEx(*hook_handle);
+        *hook_handle = std::ptr::null_mut();
     }
 
-    std::thread::spawn(move || unsafe {
-        let mut registered_ids: Vec<i32> = Vec::new();
-        let mut fallback_specs: Vec<HotkeySpec> = Vec::new();
+    let bindings = desired.lock().map(|g| g.clone()).unwrap_or_default();
 
-        for (idx, spec) in hotkeys.into_iter().enumerate() {
-            let id = (idx + 1) as i32;
-            let mods = win32_modifiers_for_spec(&spec);
-            if RegisterHotKey(std::ptr::null_mut(), id, mods, spec.vk) != 0 {
-                registered_ids.push(id);
-            } else {
-                fallback_specs.push(spec);
-            }
+    let mut fallback_hooks: Vec<HotkeyBinding> = Vec::new();
+    let mut conflicts: Vec<String> = Vec::new();
+
+    for (idx, binding) in bindings.into_iter().enumerate() {
+        let id = (idx + 1) as i32;
+        let mods = win32_modifiers_for_spec(&binding.spec);
+        if RegisterHotKey(std::ptr::null_mut(), id, mods, binding.spec.vk) != 0 {
+            registered_map.insert(id, binding);
+        } else if binding.action == HotkeyAction::ToggleOverlay {
+            fallback_hooks.push(binding);
+        } else {
+            conflicts.push(format!(
+                "{} ({})",
+                spec_to_display(&binding.spec),
+                binding.name
+            ));
         }
+    }
 
-        let hook = if !fallback_specs.is_empty() {
-            let _ = HOOK_STATE.set(HookShared {
-                hotkeys: fallback_specs,
-                tx: tx.clone(),
-                ctx: ctx.clone(),
-                pressed_vk: AtomicU32::new(0),
-                last_pressed_ms: AtomicU64::new(0),
-                mod_mask: AtomicU32::new(0),
-            });
-            let h = SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(ll_keyboard_proc),
-                std::ptr::null_mut(),
-                0,
-            );
-            if h.is_null() {
-                None
-            } else {
-                Some(h)
+    let shared = HOOK_STATE.get_or_init(|| HookShared {
+        hotkeys: Mutex::new(Vec::new()),
+        tx: tx.clone(),
+        ctx: ctx.clone(),
+        pressed_vk: AtomicU32::new(0),
+        last_pressed_ms: AtomicU64::new(0),
+        mod_mask: AtomicU32::new(0),
+    });
+
+    if !fallback_hooks.is_empty() {
+        let hook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            Some(ll_keyboard_proc),
+            std::ptr::null_mut(),
+            0,
+        );
+        if hook.is_null() {
+            for b in fallback_hooks {
+                conflicts.push(format!("{} ({})", spec_to_display(&b.spec), b.name));
+            }
+            if let Ok(mut g) = shared.hotkeys.lock() {
+                g.clear();
             }
         } else {
-            None
-        };
+            let fallback_count = fallback_hooks.len();
+            if let Ok(mut g) = shared.hotkeys.lock() {
+                *g = fallback_hooks;
+            }
+            *hook_handle = hook;
+            return (registered_map.len() + fallback_count, conflicts);
+        }
+    } else if let Ok(mut g) = shared.hotkeys.lock() {
+        g.clear();
+    }
 
-        if registered_ids.is_empty() && hook.is_none() {
-            return;
+    (registered_map.len(), conflicts)
+}
+
+pub fn spawn_global_hotkeys(
+    initial_bindings: Vec<HotkeyBinding>,
+    tx: mpsc::Sender<UiCommand>,
+    ctx: egui::Context,
+) -> HotkeyController {
+    let thread_id = Arc::new(AtomicU32::new(0));
+    let desired = Arc::new(Mutex::new(initial_bindings));
+    let announce_next = Arc::new(AtomicBool::new(false));
+
+    let tid_worker = Arc::clone(&thread_id);
+    let desired_worker = Arc::clone(&desired);
+    let announce_worker = Arc::clone(&announce_next);
+
+    std::thread::spawn(move || unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        // Force creation of this thread's Win32 message queue before exposing its thread ID
+        PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        tid_worker.store(GetCurrentThreadId(), Ordering::Release);
+
+        let mut registered_map: HashMap<i32, HotkeyBinding> = HashMap::new();
+        let mut hook_handle: HHOOK = std::ptr::null_mut();
+
+        let (_cnt, init_conflicts) = apply_bindings(
+            &desired_worker,
+            &mut registered_map,
+            &mut hook_handle,
+            &tx,
+            &ctx,
+        );
+        if !init_conflicts.is_empty() {
+            let _ = tx.send(UiCommand::HotkeysReloaded(
+                false,
+                format!("Hotkey conflict: {}", init_conflicts.join(", ")),
+            ));
+            ctx.request_repaint();
         }
 
-        let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            if msg.message == WM_HOTKEY && try_claim_toggle_debounce(180) {
-                let _ = tx.send(UiCommand::Toggle);
-                ctx.request_repaint();
+            if msg.message == WM_RELOAD_HOTKEYS {
+                let (cnt, conflicts) = apply_bindings(
+                    &desired_worker,
+                    &mut registered_map,
+                    &mut hook_handle,
+                    &tx,
+                    &ctx,
+                );
+                if announce_worker.swap(false, Ordering::AcqRel) || !conflicts.is_empty() {
+                    if conflicts.is_empty() {
+                        let _ = tx.send(UiCommand::HotkeysReloaded(
+                            true,
+                            format!("{cnt} active global hotkey(s) registered"),
+                        ));
+                    } else {
+                        let _ = tx.send(UiCommand::HotkeysReloaded(
+                            false,
+                            format!("In use by another app: {}", conflicts.join(", ")),
+                        ));
+                    }
+                    ctx.request_repaint();
+                }
+                continue;
             }
+
+            if msg.message == WM_HOTKEY {
+                let id = msg.wParam as i32;
+                if let Some(binding) = registered_map.get(&id).cloned() {
+                    dispatch_binding(&binding, &tx, &ctx);
+                }
+                continue;
+            }
+
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        for id in registered_ids {
+        for (id, _) in registered_map.drain() {
             UnregisterHotKey(std::ptr::null_mut(), id);
         }
-        if let Some(h) = hook {
-            UnhookWindowsHookEx(h);
+        if !hook_handle.is_null() {
+            UnhookWindowsHookEx(hook_handle);
         }
     });
+
+    HotkeyController {
+        thread_id,
+        desired,
+        announce_next,
+    }
 }
 
 pub fn active_monitor_centered_pos(logical_w: f32, logical_h: f32, ppp: f32) -> (f32, f32) {
@@ -620,6 +1052,36 @@ mod tests {
         let f7 = parse_ahk_hotkey("#F7", "Win+F7").unwrap();
         assert!(f7.win && !f7.ctrl && !f7.alt);
         assert_eq!(f7.vk, 0x76);
+    }
+
+    #[test]
+    fn parses_display_and_formats_roundtrip() {
+        let s1 = parse_display_hotkey("Ctrl+Alt+K").unwrap();
+        assert_eq!(spec_to_ahk(&s1), "^!k");
+        assert_eq!(spec_to_display(&s1), "Ctrl+Alt+K");
+
+        let s2 = parse_display_hotkey("Win+Shift+F7").unwrap();
+        assert_eq!(spec_to_ahk(&s2), "#+F7");
+        assert_eq!(spec_to_display(&s2), "Win+Shift+F7");
+
+        let s3 = parse_display_hotkey("ctrl + space").unwrap();
+        assert_eq!(spec_to_ahk(&s3), "^Space");
+        assert_eq!(spec_to_display(&s3), "Ctrl+Space");
+    }
+
+    #[test]
+    fn validates_hotkey_specs() {
+        let bare_a = parse_display_hotkey("A").unwrap();
+        assert!(validate_hotkey_spec(&bare_a).is_err());
+
+        let bare_esc = parse_display_hotkey("Esc").unwrap();
+        assert!(validate_hotkey_spec(&bare_esc).is_err());
+
+        let ctrl_alt_k = parse_display_hotkey("Ctrl+Alt+K").unwrap();
+        assert!(validate_hotkey_spec(&ctrl_alt_k).is_ok());
+
+        let fn_f9 = parse_display_hotkey("F9").unwrap();
+        assert!(validate_hotkey_spec(&fn_f9).is_ok());
     }
 
     #[test]

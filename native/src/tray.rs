@@ -41,6 +41,14 @@ fn build_keyboard_icon_rgba() -> Vec<u8> {
 
 pub struct TrayHandle {
     pub _tray: TrayIcon,
+    toggle_item: MenuItem,
+}
+
+impl TrayHandle {
+    pub fn update_hotkey_labels(&self, tooltip: &str, toggle_label: &str) {
+        let _ = self._tray.set_tooltip(Some(tooltip));
+        self.toggle_item.set_text(toggle_label);
+    }
 }
 
 pub fn create_tray(
@@ -55,6 +63,7 @@ pub fn create_tray(
     let item_folder = MenuItem::new("Open Project Folder", true, None);
     let item_quit = MenuItem::new("Quit", true, None);
 
+    let toggle_item_clone = item_toggle.clone();
     let toggle_id: MenuId = item_toggle.id().clone();
     let rescan_id: MenuId = item_rescan.id().clone();
     let folder_id: MenuId = item_folder.id().clone();
@@ -112,5 +121,8 @@ pub fn create_tray(
         }
     });
 
-    Some(TrayHandle { _tray: tray })
+    Some(TrayHandle {
+        _tray: tray,
+        toggle_item: toggle_item_clone,
+    })
 }

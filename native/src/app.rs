@@ -1,4 +1,4 @@
-//! GPU-accelerated egui 0.37 overlay UI and shortcut customizer.
+//! GPU-accelerated egui 0.37 overlay UI, live hotkey settings, and shortcut customizer.
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2, ViewportCommand};
 use std::collections::BTreeMap;
@@ -10,12 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::data::{
-    add_manual, delete_manual, hide_item, load_catalog, restore_all_windows, restore_item,
-    spawn_powertoys_sync, update_manual, Catalog, ShortcutItem,
+    add_manual, collect_live_bindings, delete_manual, hide_item, load_catalog, restore_all_windows,
+    restore_item, save_local_hotkeys, spawn_powertoys_sync, update_manual, AppConfig, Catalog,
+    HotkeysConfig, ShortcutItem,
 };
 use crate::hotkey::{
-    active_monitor_centered_pos, force_focus_window, matches_egui_hotkey,
-    try_claim_toggle_debounce, HotkeySpec, UiCommand,
+    active_monitor_centered_pos, egui_key_to_display_name, force_focus_window, is_win_key_down,
+    matches_egui_hotkey, parse_ahk_hotkey, parse_display_hotkey, spec_to_ahk, spec_to_display,
+    try_claim_toggle_debounce, validate_hotkey_spec, HotkeyController, HotkeySpec, UiCommand,
 };
 use crate::tray::TrayHandle;
 
@@ -40,6 +42,7 @@ pub struct ScreenshotOpts {
     pub out_path: PathBuf,
     pub initial_filter: Option<String>,
     pub initial_search: Option<String>,
+    pub open_hotkeys_modal: bool,
     pub failed_flag: Arc<AtomicBool>,
 }
 
@@ -71,8 +74,83 @@ struct EditorModal {
     keys: String,
     name: String,
     description: String,
+    action_type: String,
+    action_target: String,
     recording_key: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HotkeysModal {
+    primary_keys: String,
+    alt_keys: String,
+    recording_slot: Option<u8>,
+    error: Option<String>,
+}
+
+fn capture_recorded_combo(ctx: &egui::Context) -> Option<String> {
+    ctx.input(|i| {
+        for ev in &i.events {
+            if let egui::Event::Key {
+                key, pressed: true, ..
+            } = ev
+            {
+                if let Some(key_name) = egui_key_to_display_name(*key) {
+                    let mut parts: Vec<String> = Vec::new();
+                    if is_win_key_down() {
+                        parts.push("Win".to_string());
+                    }
+                    if i.modifiers.ctrl {
+                        parts.push("Ctrl".to_string());
+                    }
+                    if i.modifiers.alt {
+                        parts.push("Alt".to_string());
+                    }
+                    if i.modifiers.shift {
+                        parts.push("Shift".to_string());
+                    }
+                    parts.push(key_name.to_string());
+                    return Some(parts.join("+"));
+                }
+            }
+        }
+        None
+    })
+}
+
+fn build_toggle_specs(hotkeys_cfg: &HotkeysConfig) -> (Vec<HotkeySpec>, String) {
+    let mut specs = Vec::new();
+    let mut labels = Vec::new();
+    if let Some(spec) = parse_ahk_hotkey(
+        &hotkeys_cfg.toggle_overlay,
+        &hotkeys_cfg.toggle_overlay_display,
+    ) {
+        let lbl = if hotkeys_cfg.toggle_overlay_display.trim().is_empty() {
+            spec_to_display(&spec)
+        } else {
+            hotkeys_cfg.toggle_overlay_display.trim().to_string()
+        };
+        labels.push(lbl);
+        specs.push(spec);
+    }
+    if let Some(spec) = parse_ahk_hotkey(
+        &hotkeys_cfg.toggle_overlay_alt,
+        &hotkeys_cfg.toggle_overlay_alt_display,
+    ) {
+        let lbl = if hotkeys_cfg.toggle_overlay_alt_display.trim().is_empty() {
+            spec_to_display(&spec)
+        } else {
+            hotkeys_cfg.toggle_overlay_alt_display.trim().to_string()
+        };
+        labels.push(lbl);
+        specs.push(spec);
+    }
+    let footer = if labels.is_empty() {
+        "Ctrl+Alt+K".to_string()
+    } else {
+        labels.join(" / ")
+    };
+    (specs, footer)
 }
 
 fn save_png_from_color_image(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
@@ -95,6 +173,7 @@ fn save_png_from_color_image(path: &Path, image: &egui::ColorImage) -> Result<()
 
 pub struct ShortcutHubApp {
     project_dir: PathBuf,
+    cfg: AppConfig,
     catalog: Catalog,
     filter: CategoryFilter,
     search: String,
@@ -109,8 +188,10 @@ pub struct ShortcutHubApp {
     pending_native_focus: bool,
     status_banner: Option<(String, bool)>,
     editor: Option<EditorModal>,
+    hotkeys_modal: Option<HotkeysModal>,
     hotkeys: Vec<HotkeySpec>,
     hotkeys_footer_label: String,
+    hotkey_ctrl: Option<HotkeyController>,
     cmd_rx: mpsc::Receiver<UiCommand>,
     cmd_tx: mpsc::Sender<UiCommand>,
     _tray: Option<TrayHandle>,
@@ -121,17 +202,17 @@ impl ShortcutHubApp {
     pub fn new(
         ctx: &egui::Context,
         project_dir: PathBuf,
+        cfg: AppConfig,
+        catalog: Catalog,
         start_visible: bool,
         smoke_test: bool,
         screenshot: Option<ScreenshotOpts>,
-        hotkeys: Vec<HotkeySpec>,
-        hotkeys_footer_label: String,
+        hotkey_ctrl: Option<HotkeyController>,
         cmd_rx: mpsc::Receiver<UiCommand>,
         cmd_tx: mpsc::Sender<UiCommand>,
         tray: Option<TrayHandle>,
     ) -> Self {
         Self::apply_theme(ctx);
-        let catalog = load_catalog(&project_dir);
         let automated = smoke_test || screenshot.is_some();
         let focus_search_frames = if start_visible && !automated { 3 } else { 0 };
         if start_visible && !automated {
@@ -149,8 +230,22 @@ impl ShortcutHubApp {
             .and_then(|s| s.initial_search.clone())
             .unwrap_or_default();
 
+        let (hotkeys, hotkeys_footer_label) = build_toggle_specs(&cfg.hotkeys);
+        let open_hotkeys_modal = screenshot.as_ref().is_some_and(|s| s.open_hotkeys_modal);
+        let hotkeys_modal = if open_hotkeys_modal {
+            Some(HotkeysModal {
+                primary_keys: cfg.hotkeys.toggle_overlay_display.clone(),
+                alt_keys: cfg.hotkeys.toggle_overlay_alt_display.clone(),
+                recording_slot: None,
+                error: None,
+            })
+        } else {
+            None
+        };
+
         Self {
             project_dir,
+            cfg,
             catalog,
             filter: initial_filter,
             search: initial_search,
@@ -165,8 +260,10 @@ impl ShortcutHubApp {
             pending_native_focus: false,
             status_banner: None,
             editor: None,
+            hotkeys_modal,
             hotkeys,
             hotkeys_footer_label,
+            hotkey_ctrl,
             cmd_rx,
             cmd_tx,
             _tray: tray,
@@ -194,6 +291,23 @@ impl ShortcutHubApp {
         ctx.set_visuals(visuals);
     }
 
+    fn pause_hotkeys_for_recording(&self) {
+        if let Some(ctrl) = &self.hotkey_ctrl {
+            ctrl.pause_for_recording();
+        }
+    }
+
+    fn reload_live_hotkeys(&self) {
+        if let Some(ctrl) = &self.hotkey_ctrl {
+            let bindings = collect_live_bindings(&self.cfg, &self.catalog);
+            ctrl.reload(bindings);
+        }
+    }
+
+    fn any_modal_open(&self) -> bool {
+        self.editor.is_some() || self.hotkeys_modal.is_some()
+    }
+
     fn show_overlay(&mut self, ctx: &egui::Context) {
         self.catalog = load_catalog(&self.project_dir);
         let (px, py) = active_monitor_centered_pos(920.0, 620.0, ctx.pixels_per_point());
@@ -207,15 +321,25 @@ impl ShortcutHubApp {
     }
 
     fn hide_overlay(&mut self, ctx: &egui::Context) {
+        let was_recording = self.editor.as_ref().is_some_and(|e| e.recording_key)
+            || self
+                .hotkeys_modal
+                .as_ref()
+                .is_some_and(|h| h.recording_slot.is_some());
         self.visible = false;
         self.editor = None;
+        self.hotkeys_modal = None;
         self.pending_native_focus = false;
+        if was_recording {
+            self.reload_live_hotkeys();
+        }
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         ctx.request_repaint();
     }
 
     fn trigger_sync(&mut self, ctx: &egui::Context, rescan: bool, pending_msg: &str) {
         self.catalog = load_catalog(&self.project_dir);
+        self.reload_live_hotkeys();
         self.status_banner = Some((pending_msg.to_string(), true));
         let tx = self.cmd_tx.clone();
         let ctx_clone = ctx.clone();
@@ -253,6 +377,11 @@ impl ShortcutHubApp {
                 }
                 UiCommand::SyncFinished(ok, msg) => {
                     self.catalog = load_catalog(&self.project_dir);
+                    self.reload_live_hotkeys();
+                    self.status_banner = Some((msg, ok));
+                    ctx.request_repaint();
+                }
+                UiCommand::HotkeysReloaded(ok, msg) => {
                     self.status_banner = Some((msg, ok));
                     ctx.request_repaint();
                 }
@@ -310,8 +439,8 @@ impl ShortcutHubApp {
                     return true;
                 }
                 let hay = format!(
-                    "{} {} {} {}",
-                    item.keys, item.name, item.description, item.category
+                    "{} {} {} {} {}",
+                    item.keys, item.name, item.description, item.category, item.action_target
                 )
                 .to_ascii_lowercase();
                 tokens.iter().all(|tok| hay.contains(tok))
@@ -319,11 +448,16 @@ impl ShortcutHubApp {
             .collect()
     }
 
-    fn source_badge(source: &str) -> (&'static str, Color32) {
-        match source {
-            "manual" => ("Manual", FG_GREEN),
-            "ahk" => ("AHK", FG_ACCENT),
-            "ahk-config" => ("Auto", FG_ACCENT),
+    fn source_badge(item: &ShortcutItem) -> (&'static str, Color32) {
+        match item.source.as_str() {
+            "manual" => {
+                if !item.action_type.is_empty() && !item.action_target.is_empty() {
+                    ("Live", FG_GREEN)
+                } else {
+                    ("Manual", FG_TEAL)
+                }
+            }
+            "ahk" | "ahk-config" => ("Auto", FG_ACCENT),
             "powertoys" => ("PowerToys", FG_YELLOW),
             "copyq" => ("CopyQ", FG_PURPLE),
             "vscode" => ("IDE", FG_TEAL),
@@ -415,6 +549,28 @@ impl ShortcutHubApp {
                         if ui
                             .add(
                                 egui::Button::new(
+                                    RichText::new("Hotkeys")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(FG_YELLOW),
+                                )
+                                .fill(BG_CARD_ALT)
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            self.editor = None;
+                            self.hotkeys_modal = Some(HotkeysModal {
+                                primary_keys: self.cfg.hotkeys.toggle_overlay_display.clone(),
+                                alt_keys: self.cfg.hotkeys.toggle_overlay_alt_display.clone(),
+                                recording_slot: None,
+                                error: None,
+                            });
+                        }
+
+                        if ui
+                            .add(
+                                egui::Button::new(
                                     RichText::new("+ Add Shortcut")
                                         .size(12.0)
                                         .strong()
@@ -425,12 +581,15 @@ impl ShortcutHubApp {
                             )
                             .clicked()
                         {
+                            self.hotkeys_modal = None;
                             self.editor = Some(EditorModal {
                                 editing_id: None,
                                 category: "Custom".to_string(),
                                 keys: String::new(),
                                 name: String::new(),
                                 description: String::new(),
+                                action_type: String::new(),
+                                action_target: String::new(),
                                 recording_key: false,
                                 error: None,
                             });
@@ -467,7 +626,7 @@ impl ShortcutHubApp {
                             .font(egui::FontId::proportional(14.5))
                             .hint_text("Filter by key, action, app, or category..."),
                     );
-                    if self.focus_search_frames > 0 && self.editor.is_none() {
+                    if self.focus_search_frames > 0 && !self.any_modal_open() {
                         search_resp.request_focus();
                         self.focus_search_frames -= 1;
                     }
@@ -711,8 +870,7 @@ impl ShortcutHubApp {
                                                 }
                                             }
 
-                                            let (src_lbl, src_col) =
-                                                Self::source_badge(&item.source);
+                                            let (src_lbl, src_col) = Self::source_badge(item);
                                             ui.add_space(6.0);
                                             ui.label(
                                                 RichText::new(src_lbl)
@@ -742,16 +900,309 @@ impl ShortcutHubApp {
                 self.trigger_sync(ctx, false, "Custom shortcut deleted — syncing...");
             }
         } else if let Some(item) = edit_item {
+            self.hotkeys_modal = None;
             self.editor = Some(EditorModal {
                 editing_id: Some(item.id),
                 category: item.category,
                 keys: item.keys,
                 name: item.name,
                 description: item.description,
+                action_type: item.action_type,
+                action_target: item.action_target,
                 recording_key: false,
                 error: None,
             });
         }
+    }
+
+    fn render_hotkeys_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.hotkeys_modal.take() else {
+            return;
+        };
+
+        let mut close_modal = false;
+        let mut save_requested = false;
+        let mut restore_live_needed = false;
+
+        if let Some(slot) = modal.recording_slot {
+            if let Some(combo) = capture_recorded_combo(ctx) {
+                if slot == 0 {
+                    modal.primary_keys = combo;
+                } else {
+                    modal.alt_keys = combo;
+                }
+                modal.recording_slot = None;
+                modal.error = None;
+                restore_live_needed = true;
+            }
+        }
+
+        egui::Window::new("Configure Hotkeys")
+            .collapsible(false)
+            .resizable(false)
+            .fade_in(false)
+            .fade_out(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(490.0, 285.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(BG_MAIN)
+                    .stroke(Stroke::new(1.5, FG_ACCENT))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Assign the global shortcuts used to open and close Shortcut Hub. Changes apply immediately without restarting.")
+                        .size(11.5)
+                        .color(FG_MUTED),
+                );
+                ui.add_space(10.0);
+
+                ui.label(
+                    RichText::new("Primary Overlay Toggle:")
+                        .size(12.0)
+                        .strong()
+                        .color(FG_TEXT),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.primary_keys)
+                            .text_color(FG_TEXT)
+                            .desired_width(275.0)
+                            .hint_text("e.g. Ctrl+Alt+K"),
+                    );
+                    let rec_active = modal.recording_slot == Some(0);
+                    let rec_lbl = if rec_active { "Press Keys..." } else { "Record" };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(rec_lbl).size(11.5).strong().color(
+                                if rec_active { FG_DARK } else { FG_TEXT },
+                            ))
+                            .fill(if rec_active { FG_YELLOW } else { BG_KEYCAP })
+                            .corner_radius(CornerRadius::same(5)),
+                        )
+                        .clicked()
+                    {
+                        if rec_active {
+                            modal.recording_slot = None;
+                            restore_live_needed = true;
+                        } else {
+                            modal.recording_slot = Some(0);
+                            self.pause_hotkeys_for_recording();
+                        }
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Clear").size(11.5).color(FG_MUTED))
+                                .fill(BG_CARD_ALT)
+                                .corner_radius(CornerRadius::same(5)),
+                        )
+                        .clicked()
+                    {
+                        modal.primary_keys.clear();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Alternate Overlay Toggle (optional):")
+                        .size(12.0)
+                        .strong()
+                        .color(FG_TEXT),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.alt_keys)
+                            .text_color(FG_TEXT)
+                            .desired_width(275.0)
+                            .hint_text("e.g. Win+F7 or blank to disable"),
+                    );
+                    let rec_active = modal.recording_slot == Some(1);
+                    let rec_lbl = if rec_active { "Press Keys..." } else { "Record" };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(rec_lbl).size(11.5).strong().color(
+                                if rec_active { FG_DARK } else { FG_TEXT },
+                            ))
+                            .fill(if rec_active { FG_YELLOW } else { BG_KEYCAP })
+                            .corner_radius(CornerRadius::same(5)),
+                        )
+                        .clicked()
+                    {
+                        if rec_active {
+                            modal.recording_slot = None;
+                            restore_live_needed = true;
+                        } else {
+                            modal.recording_slot = Some(1);
+                            self.pause_hotkeys_for_recording();
+                        }
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Clear").size(11.5).color(FG_MUTED))
+                                .fill(BG_CARD_ALT)
+                                .corner_radius(CornerRadius::same(5)),
+                        )
+                        .clicked()
+                    {
+                        modal.alt_keys.clear();
+                    }
+                });
+
+                if let Some(err) = &modal.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(err).size(11.5).color(FG_RED));
+                }
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Reset Defaults").size(11.5).color(FG_MUTED),
+                            )
+                            .fill(BG_CARD_ALT)
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .clicked()
+                    {
+                        modal.primary_keys = "Ctrl+Alt+K".to_string();
+                        modal.alt_keys = "Win+F7".to_string();
+                        modal.recording_slot = None;
+                        modal.error = None;
+                        restore_live_needed = true;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Save & Apply")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(FG_DARK),
+                                )
+                                .fill(FG_ACCENT)
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            save_requested = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Cancel").size(12.5).color(FG_TEXT),
+                                )
+                                .fill(BG_CARD_ALT)
+                                .corner_radius(CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            close_modal = true;
+                        }
+                    });
+                });
+            });
+
+        if save_requested {
+            let primary_raw = modal.primary_keys.trim();
+            let alt_raw = modal.alt_keys.trim();
+
+            let mut validation_err: Option<String> = None;
+            let primary_spec = if primary_raw.is_empty() {
+                validation_err = Some("Primary overlay toggle hotkey cannot be empty.".to_string());
+                None
+            } else if let Some(spec) = parse_display_hotkey(primary_raw) {
+                if let Err(e) = validate_hotkey_spec(&spec) {
+                    validation_err = Some(e);
+                    None
+                } else {
+                    Some(spec)
+                }
+            } else {
+                validation_err = Some(format!(
+                    "Could not parse '{primary_raw}' (try e.g. Ctrl+Alt+K)."
+                ));
+                None
+            };
+
+            let alt_spec = if validation_err.is_some() || alt_raw.is_empty() {
+                None
+            } else if let Some(spec) = parse_display_hotkey(alt_raw) {
+                if let Err(e) = validate_hotkey_spec(&spec) {
+                    validation_err = Some(e);
+                    None
+                } else {
+                    Some(spec)
+                }
+            } else {
+                validation_err = Some(format!(
+                    "Could not parse '{alt_raw}' (try e.g. Win+F7 or Clear)."
+                ));
+                None
+            };
+
+            if validation_err.is_none() {
+                if let (Some(p), Some(a)) = (&primary_spec, &alt_spec) {
+                    if p.ctrl == a.ctrl
+                        && p.alt == a.alt
+                        && p.shift == a.shift
+                        && p.win == a.win
+                        && p.vk == a.vk
+                    {
+                        validation_err =
+                            Some("Primary and alternate hotkeys must be different.".to_string());
+                    }
+                }
+            }
+
+            if let Some(err) = validation_err {
+                modal.error = Some(err);
+            } else if let Some(p_spec) = primary_spec {
+                let new_hk = HotkeysConfig {
+                    toggle_overlay: spec_to_ahk(&p_spec),
+                    toggle_overlay_display: spec_to_display(&p_spec),
+                    toggle_overlay_alt: alt_spec.as_ref().map(spec_to_ahk).unwrap_or_default(),
+                    toggle_overlay_alt_display: alt_spec
+                        .as_ref()
+                        .map(spec_to_display)
+                        .unwrap_or_default(),
+                };
+                match save_local_hotkeys(&self.project_dir, &new_hk) {
+                    Ok(()) => {
+                        self.cfg.hotkeys = new_hk;
+                        let (specs, footer_lbl) = build_toggle_specs(&self.cfg.hotkeys);
+                        self.hotkeys = specs;
+                        self.hotkeys_footer_label = footer_lbl.clone();
+                        if let Some(tray) = &self._tray {
+                            let tooltip = format!("Shortcut Hub ({footer_lbl})");
+                            let toggle_lbl = format!("Toggle Shortcut Hub ({footer_lbl})");
+                            tray.update_hotkey_labels(&tooltip, &toggle_lbl);
+                        }
+                        self.reload_live_hotkeys();
+                        self.status_banner = Some((format!("Saved & active: {footer_lbl}"), true));
+                        return;
+                    }
+                    Err(e) => {
+                        modal.error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if close_modal {
+            if modal.recording_slot.is_some() || restore_live_needed {
+                self.reload_live_hotkeys();
+            }
+            return;
+        }
+
+        if restore_live_needed {
+            self.reload_live_hotkeys();
+        }
+        self.hotkeys_modal = Some(modal);
     }
 
     fn render_editor_modal(&mut self, ctx: &egui::Context) {
@@ -761,6 +1212,7 @@ impl ShortcutHubApp {
 
         let mut close_modal = false;
         let mut save_requested = false;
+        let mut restore_live_needed = false;
         let title = if modal.editing_id.is_some() {
             "Edit Custom Shortcut"
         } else {
@@ -768,42 +1220,21 @@ impl ShortcutHubApp {
         };
 
         if modal.recording_key {
-            let captured: Option<String> = ctx.input(|i| {
-                for ev in &i.events {
-                    if let egui::Event::Key {
-                        key, pressed: true, ..
-                    } = ev
-                    {
-                        let mut parts: Vec<String> = Vec::new();
-                        if i.modifiers.ctrl {
-                            parts.push("Ctrl".to_string());
-                        }
-                        if i.modifiers.alt {
-                            parts.push("Alt".to_string());
-                        }
-                        if i.modifiers.shift {
-                            parts.push("Shift".to_string());
-                        }
-                        if i.modifiers.mac_cmd || i.modifiers.command && !i.modifiers.ctrl {
-                            parts.push("Win".to_string());
-                        }
-                        parts.push(key.name().to_string());
-                        return Some(parts.join("+"));
-                    }
-                }
-                None
-            });
-            if let Some(combo) = captured {
+            if let Some(combo) = capture_recorded_combo(ctx) {
                 modal.keys = combo;
                 modal.recording_key = false;
+                modal.error = None;
+                restore_live_needed = true;
             }
         }
 
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
+            .fade_in(false)
+            .fade_out(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(430.0, 290.0))
+            .fixed_size(Vec2::new(450.0, 380.0))
             .frame(
                 egui::Frame::new()
                     .fill(BG_MAIN)
@@ -821,7 +1252,7 @@ impl ShortcutHubApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut modal.category)
                             .text_color(FG_TEXT)
-                            .desired_width(250.0),
+                            .desired_width(270.0),
                     );
                     egui::ComboBox::from_id_salt("cat_pick")
                         .selected_text("Presets")
@@ -848,7 +1279,7 @@ impl ShortcutHubApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut modal.keys)
                             .text_color(FG_TEXT)
-                            .desired_width(305.0),
+                            .desired_width(325.0),
                     );
                     let rec_lbl = if modal.recording_key {
                         "Press Keys..."
@@ -874,6 +1305,11 @@ impl ShortcutHubApp {
                         .clicked()
                     {
                         modal.recording_key = !modal.recording_key;
+                        if modal.recording_key {
+                            self.pause_hotkeys_for_recording();
+                        } else {
+                            restore_live_needed = true;
+                        }
                     }
                 });
 
@@ -896,6 +1332,54 @@ impl ShortcutHubApp {
                         .text_color(FG_TEXT)
                         .desired_width(f32::INFINITY),
                 );
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Action Binding (optional live global hotkey):")
+                        .size(12.0)
+                        .color(FG_MUTED),
+                );
+                ui.horizontal(|ui| {
+                    for (kind, lbl) in [
+                        ("", "Reference Only"),
+                        ("open", "Open App / URL"),
+                        ("command", "Run Command"),
+                    ] {
+                        let selected = modal.action_type == kind;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(lbl).size(11.5).strong().color(if selected {
+                                        FG_DARK
+                                    } else {
+                                        FG_TEXT
+                                    }),
+                                )
+                                .fill(if selected { FG_GREEN } else { BG_CARD_ALT })
+                                .corner_radius(CornerRadius::same(5)),
+                            )
+                            .clicked()
+                        {
+                            modal.action_type = kind.to_string();
+                            modal.error = None;
+                        }
+                    }
+                });
+
+                if !modal.action_type.is_empty() {
+                    ui.add_space(6.0);
+                    let hint = if modal.action_type == "open" {
+                        "Path, URL, or URI (e.g. notepad.exe or https://example.com)"
+                    } else {
+                        "PowerShell command run hidden on hotkey press"
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.action_target)
+                            .text_color(FG_TEXT)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(hint),
+                    );
+                }
 
                 if let Some(err) = &modal.error {
                     ui.add_space(6.0);
@@ -933,39 +1417,73 @@ impl ShortcutHubApp {
             });
 
         if save_requested {
-            let res = if let Some(edit_id) = &modal.editing_id {
-                update_manual(
-                    &self.project_dir,
-                    edit_id,
-                    &modal.category,
-                    &modal.keys,
-                    &modal.name,
-                    &modal.description,
-                )
-            } else {
-                add_manual(
-                    &self.project_dir,
-                    &modal.category,
-                    &modal.keys,
-                    &modal.name,
-                    &modal.description,
-                )
-                .map(|_| ())
-            };
-            match res {
-                Ok(()) => {
-                    self.trigger_sync(ctx, false, "Saved & synced with PowerToys");
-                    return;
+            let mut key_check_err: Option<String> = None;
+            if !modal.action_type.is_empty() {
+                if let Some(spec) = parse_display_hotkey(&modal.keys) {
+                    if let Err(e) = validate_hotkey_spec(&spec) {
+                        key_check_err = Some(e);
+                    }
+                } else {
+                    key_check_err = Some(
+                        "Live action bindings require a valid hotkey like Ctrl+Alt+N.".to_string(),
+                    );
                 }
-                Err(e) => {
-                    modal.error = Some(e);
+            }
+
+            if let Some(err) = key_check_err {
+                modal.error = Some(err);
+            } else {
+                let target_val = if modal.action_type.is_empty() {
+                    ""
+                } else {
+                    modal.action_target.as_str()
+                };
+                let res = if let Some(edit_id) = &modal.editing_id {
+                    update_manual(
+                        &self.project_dir,
+                        edit_id,
+                        &modal.category,
+                        &modal.keys,
+                        &modal.name,
+                        &modal.description,
+                        &modal.action_type,
+                        target_val,
+                    )
+                } else {
+                    add_manual(
+                        &self.project_dir,
+                        &modal.category,
+                        &modal.keys,
+                        &modal.name,
+                        &modal.description,
+                        &modal.action_type,
+                        target_val,
+                    )
+                    .map(|_| ())
+                };
+                match res {
+                    Ok(()) => {
+                        self.trigger_sync(ctx, false, "Saved & synced with PowerToys");
+                        return;
+                    }
+                    Err(e) => {
+                        modal.error = Some(e);
+                    }
                 }
             }
         }
 
-        if !close_modal {
-            self.editor = Some(modal);
+        if close_modal {
+            if modal.recording_key || restore_live_needed {
+                self.reload_live_hotkeys();
+            }
+            return;
         }
+
+        if restore_live_needed {
+            self.reload_live_hotkeys();
+        }
+        self.editor = Some(modal);
     }
 }
 
@@ -997,7 +1515,7 @@ impl eframe::App for ShortcutHubApp {
             }
         }
 
-        if self.visible && self.editor.is_none() {
+        if self.visible && !self.any_modal_open() {
             let hotkey_pressed =
                 ctx.input(|i| self.hotkeys.iter().any(|spec| matches_egui_hotkey(i, spec)));
             if hotkey_pressed && try_claim_toggle_debounce(180) {
@@ -1011,10 +1529,15 @@ impl eframe::App for ShortcutHubApp {
                 }
             }
         } else if self.visible {
-            let esc_in_modal = self.editor.as_ref().is_some_and(|m| !m.recording_key)
-                && ctx.input(|i| i.key_pressed(egui::Key::Escape));
-            if esc_in_modal {
+            let recording = self.editor.as_ref().is_some_and(|m| m.recording_key)
+                || self
+                    .hotkeys_modal
+                    .as_ref()
+                    .is_some_and(|h| h.recording_slot.is_some());
+            if !recording && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.editor = None;
+                self.hotkeys_modal = None;
+                self.reload_live_hotkeys();
             }
         }
 
@@ -1057,6 +1580,7 @@ impl eframe::App for ShortcutHubApp {
             });
 
         self.render_editor_modal(&ctx);
+        self.render_hotkeys_modal(&ctx);
 
         if let Some(opts) = &self.screenshot {
             self.screenshot_frames += 1;

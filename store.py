@@ -154,7 +154,7 @@ def load_state(project_dir: Path) -> dict[str, Any]:
     if not path.is_file():
         return default
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict):
             default.update(data)
             return default
@@ -310,6 +310,8 @@ def add_manual_shortcut(
     keys: str,
     name: str,
     description: str = "",
+    action_type: str = "",
+    action_target: str = "",
 ) -> dict[str, Any]:
     """Add a user-defined manual shortcut and persist it."""
     cat = category.strip() or "Custom"
@@ -319,7 +321,7 @@ def add_manual_shortcut(
         raise ValueError("Both shortcut keys and name are required.")
 
     state = load_state(project_dir)
-    item = {
+    item: dict[str, Any] = {
         "id": f"manual::{uuid.uuid4().hex[:12]}",
         "category": cat,
         "keys": key_str,
@@ -327,6 +329,11 @@ def add_manual_shortcut(
         "description": description.strip(),
         "source": "manual",
     }
+    norm_kind = action_type.strip().lower()
+    norm_target = action_target.strip()
+    if norm_kind in ("open", "command") and norm_target:
+        item["action_type"] = norm_kind
+        item["action_target"] = norm_target
     state.setdefault("manual_shortcuts", []).append(item)
     save_state(project_dir, state)
     return item
@@ -339,6 +346,8 @@ def update_manual_shortcut(
     keys: str,
     name: str,
     description: str = "",
+    action_type: str = "",
+    action_target: str = "",
 ) -> dict[str, Any]:
     """Edit an existing manual shortcut by ID."""
     state = load_state(project_dir)
@@ -348,6 +357,14 @@ def update_manual_shortcut(
             item["keys"] = keys.strip()
             item["name"] = name.strip()
             item["description"] = description.strip()
+            norm_kind = action_type.strip().lower()
+            norm_target = action_target.strip()
+            if norm_kind in ("open", "command") and norm_target:
+                item["action_type"] = norm_kind
+                item["action_target"] = norm_target
+            else:
+                item.pop("action_type", None)
+                item.pop("action_target", None)
             save_state(project_dir, state)
             return dict(item)
     raise KeyError(f"Manual shortcut '{item_id}' not found.")

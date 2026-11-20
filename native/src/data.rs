@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::hotkey::{parse_ahk_hotkey, parse_display_hotkey, HotkeyAction, HotkeyBinding};
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -68,6 +70,10 @@ pub struct ShortcutItem {
     pub name: String,
     pub description: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_target: String,
     #[serde(skip)]
     pub hidden: bool,
 }
@@ -393,7 +399,7 @@ pub fn parse_windows_master_yaml(path: &Path) -> Vec<ShortcutItem> {
                 name: std::mem::take(prop_name),
                 description: std::mem::take(prop_desc),
                 source: "windows".to_string(),
-                hidden: false,
+                ..Default::default()
             });
         }
         prop_name.clear();
@@ -746,7 +752,7 @@ pub fn builtin_windows_shortcuts() -> Vec<ShortcutItem> {
             name: (*name).to_string(),
             description: (*desc).to_string(),
             source: "windows".to_string(),
-            hidden: false,
+            ..Default::default()
         })
         .collect()
 }
@@ -835,18 +841,113 @@ pub fn load_catalog(project_dir: &Path) -> Catalog {
     }
 }
 
+fn normalize_action(action_type: &str, action_target: &str) -> Result<(String, String), String> {
+    let kind = action_type.trim().to_ascii_lowercase();
+    let target = action_target.trim();
+    match kind.as_str() {
+        "" | "none" => Ok((String::new(), String::new())),
+        "open" => {
+            if target.is_empty() {
+                Err("Action target (app, file, or URL) is required for Open bindings.".to_string())
+            } else {
+                Ok(("open".to_string(), target.to_string()))
+            }
+        }
+        "command" => {
+            if target.is_empty() {
+                Err("PowerShell / CLI command is required for Run Command bindings.".to_string())
+            } else {
+                Ok(("command".to_string(), target.to_string()))
+            }
+        }
+        _ => Err(format!("Unsupported action type '{kind}'.")),
+    }
+}
+
+pub fn save_local_hotkeys(project_dir: &Path, hotkeys: &HotkeysConfig) -> Result<(), String> {
+    let local_path = project_dir.join("config.local.json");
+    let mut root_map = serde_json::Map::new();
+    if let Ok(raw) = fs::read_to_string(&local_path) {
+        let clean = raw.trim_start_matches('\u{feff}');
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(clean) {
+            root_map = map;
+        }
+    }
+
+    let hk_val = serde_json::to_value(hotkeys).map_err(|e| e.to_string())?;
+    root_map.insert("hotkeys".to_string(), hk_val);
+
+    let json = serde_json::to_string_pretty(&Value::Object(root_map)).map_err(|e| e.to_string())?;
+    let tmp = project_dir.join(format!("config.local.json.tmp.{}", std::process::id()));
+    fs::write(&tmp, format!("{json}\n")).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &local_path).map_err(|e| e.to_string())
+}
+
+pub fn collect_live_bindings(cfg: &AppConfig, catalog: &Catalog) -> Vec<HotkeyBinding> {
+    let mut out = Vec::new();
+    if let Some(spec) = parse_ahk_hotkey(
+        &cfg.hotkeys.toggle_overlay,
+        &cfg.hotkeys.toggle_overlay_display,
+    ) {
+        let label = spec.label.clone();
+        out.push(HotkeyBinding {
+            spec,
+            action: HotkeyAction::ToggleOverlay,
+            name: format!("Toggle Overlay ({label})"),
+        });
+    }
+    if let Some(spec) = parse_ahk_hotkey(
+        &cfg.hotkeys.toggle_overlay_alt,
+        &cfg.hotkeys.toggle_overlay_alt_display,
+    ) {
+        let label = spec.label.clone();
+        out.push(HotkeyBinding {
+            spec,
+            action: HotkeyAction::ToggleOverlay,
+            name: format!("Toggle Overlay Alt ({label})"),
+        });
+    }
+
+    for item in &catalog.active {
+        if item.source != "manual" || item.hidden {
+            continue;
+        }
+        let target = item.action_target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let action = match item.action_type.trim().to_ascii_lowercase().as_str() {
+            "open" => HotkeyAction::OpenTarget(expand_env_vars(target)),
+            "command" => HotkeyAction::RunCommand(target.to_string()),
+            _ => continue,
+        };
+        if let Some(spec) = parse_display_hotkey(&item.keys) {
+            out.push(HotkeyBinding {
+                spec,
+                action,
+                name: item.name.clone(),
+            });
+        }
+    }
+
+    out
+}
+
 pub fn add_manual(
     project_dir: &Path,
     category: &str,
     keys: &str,
     name: &str,
     description: &str,
+    action_type: &str,
+    action_target: &str,
 ) -> Result<ShortcutItem, String> {
     let key_str = keys.trim();
     let title = name.trim();
     if key_str.is_empty() || title.is_empty() {
         return Err("Both shortcut keys and action name are required.".to_string());
     }
+    let (norm_type, norm_target) = normalize_action(action_type, action_target)?;
     let cat = if category.trim().is_empty() {
         "Custom"
     } else {
@@ -863,6 +964,8 @@ pub fn add_manual(
         name: title.to_string(),
         description: description.trim().to_string(),
         source: "manual".to_string(),
+        action_type: norm_type,
+        action_target: norm_target,
         hidden: false,
     };
     let mut state = load_state(project_dir);
@@ -871,6 +974,7 @@ pub fn add_manual(
     Ok(item)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_manual(
     project_dir: &Path,
     item_id: &str,
@@ -878,12 +982,15 @@ pub fn update_manual(
     keys: &str,
     name: &str,
     description: &str,
+    action_type: &str,
+    action_target: &str,
 ) -> Result<(), String> {
     let key_str = keys.trim();
     let title = name.trim();
     if key_str.is_empty() || title.is_empty() {
         return Err("Both shortcut keys and action name are required.".to_string());
     }
+    let (norm_type, norm_target) = normalize_action(action_type, action_target)?;
     let mut state = load_state(project_dir);
     let Some(entry) = state.manual_shortcuts.iter_mut().find(|x| x.id == item_id) else {
         return Err(format!("Shortcut '{item_id}' not found."));
@@ -896,6 +1003,8 @@ pub fn update_manual(
     entry.keys = key_str.to_string();
     entry.name = title.to_string();
     entry.description = description.trim().to_string();
+    entry.action_type = norm_type;
+    entry.action_target = norm_target;
     save_state(project_dir, &state)
 }
 
@@ -1079,7 +1188,16 @@ mod tests {
         .unwrap();
 
         let baseline = load_catalog(&dir).active.len();
-        let added = add_manual(&dir, "Notes", "Ctrl+Alt+N", "Quick Note", "Opens note").unwrap();
+        let added = add_manual(
+            &dir,
+            "Notes",
+            "Ctrl+Alt+N",
+            "Quick Note",
+            "Opens note",
+            "open",
+            "notepad.exe",
+        )
+        .unwrap();
         assert!(added.id.starts_with("manual::"));
 
         update_manual(
@@ -1089,11 +1207,14 @@ mod tests {
             "Ctrl+Alt+M",
             "Quick Note v2",
             "Updated",
+            "command",
+            "Write-Output ok",
         )
         .unwrap();
         let cat = load_catalog(&dir);
         assert_eq!(cat.active.len(), baseline + 1);
         assert_eq!(cat.active[0].keys, "Ctrl+Alt+M");
+        assert_eq!(cat.active[0].action_type, "command");
 
         hide_item(&dir, &added.id).unwrap();
         assert_eq!(load_catalog(&dir).hidden.len(), 1);
@@ -1103,6 +1224,91 @@ mod tests {
 
         delete_manual(&dir, &added.id).unwrap();
         assert_eq!(load_catalog(&dir).active.len(), baseline);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_local_hotkeys_preserves_other_local_fields() {
+        let dir = std::env::temp_dir().join(format!("sh_save_hk_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join("config.json"),
+            r##"{"hotkeys":{"toggle_overlay":"^!k","toggle_overlay_display":"Ctrl+Alt+K","toggle_overlay_alt":"#F7","toggle_overlay_alt_display":"Win+F7"}}"##,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("config.local.json"),
+            r#"{"discovery":{"extra_watch_dirs":["C:\\CustomScripts"]}}"#,
+        )
+        .unwrap();
+
+        let new_hk = HotkeysConfig {
+            toggle_overlay: "^!p".to_string(),
+            toggle_overlay_display: "Ctrl+Alt+P".to_string(),
+            toggle_overlay_alt: String::new(),
+            toggle_overlay_alt_display: String::new(),
+        };
+        save_local_hotkeys(&dir, &new_hk).unwrap();
+
+        let reloaded_cfg = load_config(&dir);
+        assert_eq!(reloaded_cfg.hotkeys.toggle_overlay, "^!p");
+        assert_eq!(reloaded_cfg.hotkeys.toggle_overlay_display, "Ctrl+Alt+P");
+        assert_eq!(reloaded_cfg.hotkeys.toggle_overlay_alt, "");
+
+        let raw_local: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("config.local.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw_local["discovery"]["extra_watch_dirs"][0],
+            "C:\\CustomScripts"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_live_bindings_includes_active_actions_and_excludes_hidden() {
+        let dir = std::env::temp_dir().join(format!("sh_live_bind_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join("state"));
+        fs::write(
+            dir.join("config.json"),
+            r#"{"powertoys":{"master_shell_yml":"Z:\\missing.yml","user_shortcuts_dir":"Z:\\missing"}}"#,
+        )
+        .unwrap();
+
+        let open_item = add_manual(
+            &dir,
+            "Apps",
+            "Ctrl+Alt+O",
+            "Open Notepad",
+            "Launches Notepad",
+            "open",
+            "notepad.exe",
+        )
+        .unwrap();
+        let ref_item = add_manual(
+            &dir,
+            "Refs",
+            "Ctrl+Alt+R",
+            "Reference Only",
+            "Just a note",
+            "",
+            "",
+        )
+        .unwrap();
+        assert!(!ref_item.id.is_empty());
+
+        let cfg = load_config(&dir);
+        let cat = load_catalog(&dir);
+        let live = collect_live_bindings(&cfg, &cat);
+        assert!(live
+            .iter()
+            .any(|b| matches!(&b.action, HotkeyAction::OpenTarget(t) if t == "notepad.exe")));
+        assert!(!live.iter().any(|b| b.name == "Reference Only"));
+
+        hide_item(&dir, &open_item.id).unwrap();
+        let cat_hidden = load_catalog(&dir);
+        let live_after_hide = collect_live_bindings(&cfg, &cat_hidden);
+        assert!(!live_after_hide.iter().any(|b| b.name == "Open Notepad"));
         let _ = fs::remove_dir_all(&dir);
     }
 

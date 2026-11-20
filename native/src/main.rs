@@ -12,10 +12,10 @@ use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 use crate::app::{ScreenshotOpts, ShortcutHubApp};
-use crate::data::{load_catalog, load_config, resolve_project_dir};
+use crate::data::{collect_live_bindings, load_catalog, load_config, resolve_project_dir};
 use crate::hotkey::{
-    acquire_single_instance, parse_ahk_hotkey, spawn_event_listener, spawn_global_hotkeys,
-    HotkeySpec, SingleInstanceOutcome, UiCommand,
+    acquire_single_instance, spawn_event_listener, spawn_global_hotkeys, SingleInstanceOutcome,
+    UiCommand,
 };
 use crate::tray::create_tray;
 
@@ -71,6 +71,7 @@ fn main() -> eframe::Result<()> {
     let mut screenshot_path: Option<PathBuf> = None;
     let mut initial_filter: Option<String> = None;
     let mut initial_search: Option<String> = None;
+    let mut open_hotkeys_modal = false;
     let mut project_dir_override: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
@@ -79,6 +80,7 @@ fn main() -> eframe::Result<()> {
             "--hidden" => start_hidden = true,
             "--bench" => bench_mode = true,
             "--smoke-test" => smoke_test = true,
+            "--open-hotkeys" => open_hotkeys_modal = true,
             "--screenshot" => {
                 if let Some(p) = args.next() {
                     screenshot_path = Some(PathBuf::from(p));
@@ -128,27 +130,16 @@ fn main() -> eframe::Result<()> {
     };
 
     let cfg = load_config(&project_dir);
-    let mut hotkeys: Vec<HotkeySpec> = Vec::new();
-    let mut labels: Vec<String> = Vec::new();
-    if let Some(spec) = parse_ahk_hotkey(
-        &cfg.hotkeys.toggle_overlay,
-        &cfg.hotkeys.toggle_overlay_display,
-    ) {
-        if !cfg.hotkeys.toggle_overlay_display.trim().is_empty() {
-            labels.push(cfg.hotkeys.toggle_overlay_display.trim().to_string());
-        }
-        hotkeys.push(spec);
-    }
-    if let Some(spec) = parse_ahk_hotkey(
-        &cfg.hotkeys.toggle_overlay_alt,
-        &cfg.hotkeys.toggle_overlay_alt_display,
-    ) {
-        if !cfg.hotkeys.toggle_overlay_alt_display.trim().is_empty() {
-            labels.push(cfg.hotkeys.toggle_overlay_alt_display.trim().to_string());
-        }
-        hotkeys.push(spec);
-    }
+    let initial_catalog = load_catalog(&project_dir);
+    let initial_bindings = collect_live_bindings(&cfg, &initial_catalog);
 
+    let mut labels: Vec<String> = Vec::new();
+    if !cfg.hotkeys.toggle_overlay_display.trim().is_empty() {
+        labels.push(cfg.hotkeys.toggle_overlay_display.trim().to_string());
+    }
+    if !cfg.hotkeys.toggle_overlay_alt_display.trim().is_empty() {
+        labels.push(cfg.hotkeys.toggle_overlay_alt_display.trim().to_string());
+    }
     let hotkeys_label = if labels.is_empty() {
         "Ctrl+Alt+K / Win+F7".to_string()
     } else {
@@ -160,6 +151,7 @@ fn main() -> eframe::Result<()> {
         out_path,
         initial_filter,
         initial_search,
+        open_hotkeys_modal,
         failed_flag: Arc::clone(&screenshot_failed),
     });
 
@@ -175,9 +167,6 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let app_hotkeys = hotkeys.clone();
-    let app_hotkeys_label = hotkeys_label.clone();
-
     let run_res = eframe::run_native(
         "Shortcut Hub",
         options,
@@ -191,22 +180,26 @@ fn main() -> eframe::Result<()> {
                 create_tray(&tooltip, &toggle_lbl, tx.clone(), cc.egui_ctx.clone())
             };
 
-            if !automated {
-                spawn_global_hotkeys(hotkeys, tx.clone(), cc.egui_ctx.clone());
+            let hotkey_ctrl = if !automated {
+                let ctrl = spawn_global_hotkeys(initial_bindings, tx.clone(), cc.egui_ctx.clone());
                 if let Some((_mutex_handle, ev_handle)) = single {
                     // SendHandle intentionally does not close the Win32 mutex HANDLE on drop
                     spawn_event_listener(ev_handle, tx.clone(), cc.egui_ctx.clone());
                 }
-            }
+                Some(ctrl)
+            } else {
+                None
+            };
 
             Ok(Box::new(ShortcutHubApp::new(
                 &cc.egui_ctx,
                 project_dir,
+                cfg,
+                initial_catalog,
                 start_visible,
                 smoke_test,
                 screenshot_opts,
-                app_hotkeys,
-                app_hotkeys_label,
+                hotkey_ctrl,
                 rx,
                 tx,
                 tray,

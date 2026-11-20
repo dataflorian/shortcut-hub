@@ -1,0 +1,13 @@
+state/
+config.local.json
+shortcut-hub.exe
+native/target/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.mp4
+*.zip
+.env
+.DS_Store
+Thumbs.db

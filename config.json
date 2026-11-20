@@ -1,0 +1,32 @@
+{
+  "hotkeys": {
+    "toggle_overlay": "^!k",
+    "toggle_overlay_display": "Ctrl+Alt+K",
+    "toggle_overlay_alt": "#F7",
+    "toggle_overlay_alt_display": "Win+F7"
+  },
+  "powertoys": {
+    "master_shell_yml": "C:\\Program Files\\PowerToys\\WinUI3Apps\\Assets\\ShortcutGuide\\Manifests\\+WindowsNT.Shell.en-US.yml",
+    "user_shortcuts_dir": "%LOCALAPPDATA%\\Microsoft\\WinGet\\KeyboardShortcuts",
+    "index_generator_exe": "C:\\Program Files\\PowerToys\\WinUI3Apps\\PowerToys.ShortcutGuide.IndexYmlGenerator.exe",
+    "custom_manifest_name": "+Custom.MyShortcuts.en-US.yml",
+    "sync_enabled": true
+  },
+  "discovery": {
+    "scan_startup_dir": true,
+    "extra_watch_dirs": [],
+    "category_hints": {},
+    "scan_powertoys_manifest": true,
+    "scan_copyq": true,
+    "scan_vscode_keybindings": true,
+    "ignore_dir_names": [
+      "backup_original",
+      ".git",
+      "__pycache__",
+      "node_modules",
+      "venv",
+      ".venv",
+      "target"
+    ]
+  }
+}

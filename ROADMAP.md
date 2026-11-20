@@ -1,5 +1,12 @@
 # Shortcut Hub Roadmap & Future Architecture Ideas
 
+## Shipped in `v0.5.0`
+
+- **Full-Screen Multi-Column Overview & Auto-Focused Search**: Opens across the active monitor work area with responsive multi-column grids (`2–4` columns) and immediately focuses the search bar when toggled open.
+- **Quick Reference & Notes Sidebar (`/skills`, Snippets, Scratchpad)**: Dedicated right-hand reference panel for AI prompt `/skills`, reusable templates, and CLI snippets with 1-click **`Copy`**, **`Pin`**, and an auto-saved multiline **`Scratchpad`**.
+- **Shortcut Learning Highlights (`Pin` / `Pinned`)**: Pin individual shortcuts in gold to stand out while internalizing them, with a dedicated `Pinned (N)` filter chip.
+- **Restore Undo (`Undo Restore`) & Header Click Fix**: Fixed header button interaction capture and added one-click revert for `Restore Windows`.
+
 ## Shipped in `v0.4.0`
 
 - **In-UI Overlay Hotkey Settings (`Hotkeys`)**: Reassign both the Primary and Alternate global overlay toggle shortcuts directly inside the UI using live **`Record`**, **`Clear`**, **`Reset Defaults`**, and **`Save & Apply`**, persisted cleanly to gitignored `config.local.json`.

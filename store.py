@@ -148,6 +148,9 @@ def load_state(project_dir: Path) -> dict[str, Any]:
     default = {
         "manual_shortcuts": [],
         "hidden_ids": [],
+        "highlighted_ids": [],
+        "quick_notes": [],
+        "scratchpad": "",
         "discovered_cache": [],
         "last_scan_utc": "",
     }

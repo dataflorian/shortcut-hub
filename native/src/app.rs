@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use crate::data::{
-    add_manual, collect_live_bindings, delete_manual, hide_item, load_catalog, restore_all_windows,
-    restore_item, save_local_hotkeys, spawn_powertoys_sync, update_manual, AppConfig, Catalog,
-    HotkeysConfig, ShortcutItem,
+    add_manual, add_quick_note, collect_live_bindings, delete_manual, delete_quick_note, hide_item,
+    hide_items, load_catalog, restore_all_windows, restore_item, save_local_hotkeys,
+    save_scratchpad, spawn_powertoys_sync, toggle_highlight, toggle_quick_note_pin, update_manual,
+    update_quick_note, AppConfig, Catalog, HotkeysConfig, QuickNote, ShortcutItem,
 };
 use crate::hotkey::{
-    active_monitor_centered_pos, egui_key_to_display_name, force_focus_window, is_win_key_down,
+    active_monitor_work_rect, egui_key_to_display_name, force_focus_window, is_win_key_down,
     matches_egui_hotkey, parse_ahk_hotkey, parse_display_hotkey, spec_to_ahk, spec_to_display,
     try_claim_toggle_debounce, validate_hotkey_spec, HotkeyController, HotkeySpec, UiCommand,
 };
@@ -35,6 +37,8 @@ const FG_RED: Color32 = Color32::from_rgb(243, 139, 168); // #F38BA8
 const FG_YELLOW: Color32 = Color32::from_rgb(249, 226, 175); // #F9E2AF
 const FG_PURPLE: Color32 = Color32::from_rgb(203, 166, 247); // #CBA6F7
 const FG_TEAL: Color32 = Color32::from_rgb(148, 226, 213); // #94E2D5
+const BG_CARD_HL: Color32 = Color32::from_rgb(54, 49, 36); // Warm gold-tinted card
+const BORDER_CARD: Color32 = Color32::from_rgb(56, 58, 80); // Subtle card border
 const FG_DARK: Color32 = Color32::from_rgb(17, 17, 27); // #11111B
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,7 @@ pub struct ScreenshotOpts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CategoryFilter {
     All,
+    Highlighted,
     CustomAndAuto,
     Named(String),
     Windows,
@@ -59,6 +64,7 @@ impl CategoryFilter {
     fn from_cli(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "all" => Self::All,
+            "highlighted" | "pinned" => Self::Highlighted,
             "custom" | "custom & auto" => Self::CustomAndAuto,
             "windows" => Self::Windows,
             "hidden" | "hidden / restore" => Self::Hidden,
@@ -85,6 +91,15 @@ struct HotkeysModal {
     primary_keys: String,
     alt_keys: String,
     recording_slot: Option<u8>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NoteEditorModal {
+    editing_id: Option<String>,
+    category: String,
+    trigger: String,
+    content: String,
     error: Option<String>,
 }
 
@@ -187,8 +202,13 @@ pub struct ShortcutHubApp {
     focus_search_frames: u8,
     pending_native_focus: bool,
     status_banner: Option<(String, bool)>,
+    undo_hidden_snapshot: Option<Vec<String>>,
+    show_notes_panel: bool,
+    scratchpad: String,
+    scratchpad_dirty_since: Option<Instant>,
     editor: Option<EditorModal>,
     hotkeys_modal: Option<HotkeysModal>,
+    note_editor: Option<NoteEditorModal>,
     hotkeys: Vec<HotkeySpec>,
     hotkeys_footer_label: String,
     hotkey_ctrl: Option<HotkeyController>,
@@ -214,10 +234,12 @@ impl ShortcutHubApp {
     ) -> Self {
         Self::apply_theme(ctx);
         let automated = smoke_test || screenshot.is_some();
-        let focus_search_frames = if start_visible && !automated { 3 } else { 0 };
+        let focus_search_frames = if start_visible && !automated { 5 } else { 0 };
+        let pending_native_focus = start_visible && !automated;
         if start_visible && !automated {
-            let (px, py) = active_monitor_centered_pos(920.0, 620.0, ctx.pixels_per_point());
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(px, py)));
+            let (wx, wy, ww, wh) = active_monitor_work_rect(ctx.pixels_per_point());
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(wx, wy)));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(ww, wh)));
         }
 
         let initial_filter = screenshot
@@ -243,6 +265,8 @@ impl ShortcutHubApp {
             None
         };
 
+        let initial_scratchpad = catalog.scratchpad.clone();
+
         Self {
             project_dir,
             cfg,
@@ -257,10 +281,15 @@ impl ShortcutHubApp {
             screenshot_frames: 0,
             screenshot_requested: false,
             focus_search_frames,
-            pending_native_focus: false,
+            pending_native_focus,
             status_banner: None,
+            undo_hidden_snapshot: None,
+            show_notes_panel: true,
+            scratchpad: initial_scratchpad,
+            scratchpad_dirty_since: None,
             editor: None,
             hotkeys_modal,
+            note_editor: None,
             hotkeys,
             hotkeys_footer_label,
             hotkey_ctrl,
@@ -304,23 +333,35 @@ impl ShortcutHubApp {
         }
     }
 
+    fn flush_scratchpad(&mut self) {
+        if self.scratchpad_dirty_since.take().is_some()
+            && save_scratchpad(&self.project_dir, &self.scratchpad).is_ok()
+        {
+            self.catalog.scratchpad = self.scratchpad.clone();
+        }
+    }
+
     fn any_modal_open(&self) -> bool {
-        self.editor.is_some() || self.hotkeys_modal.is_some()
+        self.editor.is_some() || self.hotkeys_modal.is_some() || self.note_editor.is_some()
     }
 
     fn show_overlay(&mut self, ctx: &egui::Context) {
+        self.flush_scratchpad();
         self.catalog = load_catalog(&self.project_dir);
-        let (px, py) = active_monitor_centered_pos(920.0, 620.0, ctx.pixels_per_point());
-        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(px, py)));
+        self.scratchpad = self.catalog.scratchpad.clone();
+        let (wx, wy, ww, wh) = active_monitor_work_rect(ctx.pixels_per_point());
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(wx, wy)));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(ww, wh)));
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.visible = true;
-        self.focus_search_frames = 3;
+        self.focus_search_frames = 5;
         self.pending_native_focus = true;
         ctx.request_repaint();
     }
 
     fn hide_overlay(&mut self, ctx: &egui::Context) {
+        self.flush_scratchpad();
         let was_recording = self.editor.as_ref().is_some_and(|e| e.recording_key)
             || self
                 .hotkeys_modal
@@ -329,6 +370,7 @@ impl ShortcutHubApp {
         self.visible = false;
         self.editor = None;
         self.hotkeys_modal = None;
+        self.note_editor = None;
         self.pending_native_focus = false;
         if was_recording {
             self.reload_live_hotkeys();
@@ -338,6 +380,7 @@ impl ShortcutHubApp {
     }
 
     fn trigger_sync(&mut self, ctx: &egui::Context, rescan: bool, pending_msg: &str) {
+        self.flush_scratchpad();
         self.catalog = load_catalog(&self.project_dir);
         self.reload_live_hotkeys();
         self.status_banner = Some((pending_msg.to_string(), true));
@@ -377,6 +420,9 @@ impl ShortcutHubApp {
                 }
                 UiCommand::SyncFinished(ok, msg) => {
                     self.catalog = load_catalog(&self.project_dir);
+                    if self.scratchpad_dirty_since.is_none() {
+                        self.scratchpad = self.catalog.scratchpad.clone();
+                    }
                     self.reload_live_hotkeys();
                     self.status_banner = Some((msg, ok));
                     ctx.request_repaint();
@@ -386,6 +432,7 @@ impl ShortcutHubApp {
                     ctx.request_repaint();
                 }
                 UiCommand::Quit => {
+                    self.flush_scratchpad();
                     self.quitting = true;
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
@@ -417,6 +464,11 @@ impl ShortcutHubApp {
                 if !is_hidden {
                     match &self.filter {
                         CategoryFilter::All => {}
+                        CategoryFilter::Highlighted => {
+                            if !item.highlighted {
+                                return false;
+                            }
+                        }
                         CategoryFilter::CustomAndAuto => {
                             if item.source == "windows" || item.source == "powertoys" {
                                 return false;
@@ -471,137 +523,202 @@ impl ShortcutHubApp {
             .fill(BG_HEADER)
             .inner_margin(Margin::symmetric(14, 10));
 
-        let resp = header_frame
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Shortcut Hub")
-                            .size(17.0)
-                            .strong()
-                            .color(FG_ACCENT),
-                    );
-                    ui.add_space(8.0);
-                    if let Some((msg, ok)) = &self.status_banner {
-                        ui.label(RichText::new(msg).size(12.0).color(if *ok {
-                            FG_GREEN
-                        } else {
-                            FG_RED
-                        }));
+        header_frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Shortcut Hub")
+                        .size(17.0)
+                        .strong()
+                        .color(FG_ACCENT),
+                );
+                ui.add_space(8.0);
+                if let Some((msg, ok)) = &self.status_banner {
+                    ui.label(RichText::new(msg).size(12.0).color(if *ok {
+                        FG_GREEN
                     } else {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} active  ·  {} hidden",
-                                self.catalog.stats.active_total, self.catalog.stats.hidden_total
-                            ))
-                            .size(12.0)
-                            .color(FG_MUTED),
-                        );
+                        FG_RED
+                    }));
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} active  ·  {} pinned  ·  {} hidden",
+                            self.catalog.stats.active_total,
+                            self.catalog.stats.highlighted,
+                            self.catalog.stats.hidden_total
+                        ))
+                        .size(12.0)
+                        .color(FG_MUTED),
+                    );
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close_btn = egui::Button::new(
+                        RichText::new(" X ").size(13.0).strong().color(FG_MUTED),
+                    )
+                    .fill(BG_HEADER)
+                    .frame(false);
+                    if ui.add(close_btn).clicked() {
+                        self.hide_overlay(ctx);
                     }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = egui::Button::new(
-                            RichText::new(" X ").size(13.0).strong().color(FG_MUTED),
-                        )
-                        .fill(BG_HEADER)
-                        .frame(false);
-                        if ui.add(close_btn).clicked() {
-                            self.hide_overlay(ctx);
-                        }
-
+                    if let Some(undo_ids) = self.undo_hidden_snapshot.clone() {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("Restore Windows")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(FG_GREEN),
-                                )
-                                .fill(BG_CARD_ALT)
-                                .corner_radius(CornerRadius::same(6)),
-                            )
-                            .clicked()
-                        {
-                            if let Ok(cnt) = restore_all_windows(&self.project_dir) {
-                                self.trigger_sync(
-                                    ctx,
-                                    false,
-                                    &format!("Restored {cnt} Windows shortcut(s) — syncing..."),
-                                );
-                            }
-                        }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Auto-Scan")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(FG_TEXT),
-                                )
-                                .fill(BG_CARD_ALT)
-                                .corner_radius(CornerRadius::same(6)),
-                            )
-                            .clicked()
-                        {
-                            self.trigger_sync(ctx, true, "Auto-scanning system shortcuts...");
-                        }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Hotkeys")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(FG_YELLOW),
-                                )
-                                .fill(BG_CARD_ALT)
-                                .corner_radius(CornerRadius::same(6)),
-                            )
-                            .clicked()
-                        {
-                            self.editor = None;
-                            self.hotkeys_modal = Some(HotkeysModal {
-                                primary_keys: self.cfg.hotkeys.toggle_overlay_display.clone(),
-                                alt_keys: self.cfg.hotkeys.toggle_overlay_alt_display.clone(),
-                                recording_slot: None,
-                                error: None,
-                            });
-                        }
-
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("+ Add Shortcut")
+                                    RichText::new(format!("Undo Restore ({})", undo_ids.len()))
                                         .size(12.0)
                                         .strong()
                                         .color(FG_DARK),
                                 )
-                                .fill(FG_ACCENT)
+                                .fill(FG_YELLOW)
                                 .corner_radius(CornerRadius::same(6)),
                             )
+                            .on_hover_text("Re-hide the Windows shortcuts restored by your last Restore Windows click")
                             .clicked()
                         {
-                            self.hotkeys_modal = None;
-                            self.editor = Some(EditorModal {
-                                editing_id: None,
-                                category: "Custom".to_string(),
-                                keys: String::new(),
-                                name: String::new(),
-                                description: String::new(),
-                                action_type: String::new(),
-                                action_target: String::new(),
-                                recording_key: false,
-                                error: None,
-                            });
+                            if let Ok(cnt) = hide_items(&self.project_dir, &undo_ids) {
+                                self.undo_hidden_snapshot = None;
+                                self.trigger_sync(
+                                    ctx,
+                                    false,
+                                    &format!("Re-hid {cnt} Windows shortcut(s) — syncing..."),
+                                );
+                            }
                         }
-                    });
-                });
-            })
-            .response;
+                    }
 
-        if resp.interact(egui::Sense::drag()).drag_started() {
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-        }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Restore Windows")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(FG_GREEN),
+                            )
+                            .fill(BG_CARD_ALT)
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .on_hover_text("Un-hide any default Windows shortcuts you previously hid")
+                        .clicked()
+                    {
+                        if let Ok(restored_ids) = restore_all_windows(&self.project_dir) {
+                            if restored_ids.is_empty() {
+                                self.undo_hidden_snapshot = None;
+                                self.status_banner = Some((
+                                    "All default Windows shortcuts are already visible".to_string(),
+                                    true,
+                                ));
+                            } else {
+                                let cnt = restored_ids.len();
+                                self.undo_hidden_snapshot = Some(restored_ids);
+                                self.trigger_sync(
+                                    ctx,
+                                    false,
+                                    &format!(
+                                        "Restored {cnt} Windows shortcut(s) — click Undo Restore to revert"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Auto-Scan")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(FG_TEXT),
+                            )
+                            .fill(BG_CARD_ALT)
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .on_hover_text("Scan Startup scripts, watch folders, PowerToys, CopyQ, and IDEs")
+                        .clicked()
+                    {
+                        self.trigger_sync(ctx, true, "Auto-scanning system shortcuts...");
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Notes")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if self.show_notes_panel {
+                                        FG_DARK
+                                    } else {
+                                        FG_PURPLE
+                                    }),
+                            )
+                            .fill(if self.show_notes_panel {
+                                FG_PURPLE
+                            } else {
+                                BG_CARD_ALT
+                            })
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .on_hover_text("Show or hide the Quick Reference & Notes sidebar")
+                        .clicked()
+                    {
+                        self.show_notes_panel = !self.show_notes_panel;
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Hotkeys")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(FG_YELLOW),
+                            )
+                            .fill(BG_CARD_ALT)
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .on_hover_text("Configure global overlay toggle hotkeys")
+                        .clicked()
+                    {
+                        self.editor = None;
+                        self.note_editor = None;
+                        self.hotkeys_modal = Some(HotkeysModal {
+                            primary_keys: self.cfg.hotkeys.toggle_overlay_display.clone(),
+                            alt_keys: self.cfg.hotkeys.toggle_overlay_alt_display.clone(),
+                            recording_slot: None,
+                            error: None,
+                        });
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("+ Add Shortcut")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(FG_DARK),
+                            )
+                            .fill(FG_ACCENT)
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .on_hover_text("Add a custom shortcut or live global action")
+                        .clicked()
+                    {
+                        self.hotkeys_modal = None;
+                        self.note_editor = None;
+                        self.editor = Some(EditorModal {
+                            editing_id: None,
+                            category: "Custom".to_string(),
+                            keys: String::new(),
+                            name: String::new(),
+                            description: String::new(),
+                            action_type: String::new(),
+                            action_target: String::new(),
+                            recording_key: false,
+                            error: None,
+                        });
+                    }
+                });
+            });
+        });
     }
 
     fn render_search_and_chips(&mut self, ui: &mut egui::Ui, shown_count: usize) {
@@ -628,7 +745,9 @@ impl ShortcutHubApp {
                     );
                     if self.focus_search_frames > 0 && !self.any_modal_open() {
                         search_resp.request_focus();
+                        ui.ctx().memory_mut(|m| m.request_focus(search_resp.id));
                         self.focus_search_frames -= 1;
+                        ui.ctx().request_repaint();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -644,6 +763,10 @@ impl ShortcutHubApp {
 
         let mut chips: Vec<(CategoryFilter, String)> = vec![
             (CategoryFilter::All, "All".to_string()),
+            (
+                CategoryFilter::Highlighted,
+                format!("Pinned ({})", self.catalog.stats.highlighted),
+            ),
             (CategoryFilter::CustomAndAuto, "Custom & Auto".to_string()),
         ];
         for cat in &self.catalog.custom_categories {
@@ -689,32 +812,28 @@ impl ShortcutHubApp {
             .filter(|s| !s.is_empty())
             .collect();
 
-        ui.allocate_ui_with_layout(
-            Vec2::new(210.0, 26.0),
-            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                for (idx, tok) in tokens.iter().enumerate() {
-                    if idx > 0 {
-                        ui.label(RichText::new("+").size(11.0).color(FG_MUTED));
-                    }
-                    egui::Frame::new()
-                        .fill(BG_KEYCAP)
-                        .stroke(Stroke::new(1.0, BORDER_KEYCAP))
-                        .corner_radius(CornerRadius::same(5))
-                        .inner_margin(Margin::symmetric(7, 2))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(*tok)
-                                    .monospace()
-                                    .size(11.5)
-                                    .strong()
-                                    .color(FG_TEXT),
-                            );
-                        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(3.0, 2.0);
+            for (idx, tok) in tokens.iter().enumerate() {
+                if idx > 0 {
+                    ui.label(RichText::new("+").size(10.5).color(FG_MUTED));
                 }
-            },
-        );
+                egui::Frame::new()
+                    .fill(BG_KEYCAP)
+                    .stroke(Stroke::new(1.0, BORDER_KEYCAP))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(*tok)
+                                .monospace()
+                                .size(11.0)
+                                .strong()
+                                .color(FG_TEXT),
+                        );
+                    });
+            }
+        });
     }
 
     fn render_list(
@@ -742,9 +861,17 @@ impl ShortcutHubApp {
         let mut hide_id: Option<String> = None;
         let mut restore_id: Option<String> = None;
         let mut delete_id: Option<String> = None;
+        let mut toggle_hl_id: Option<String> = None;
         let mut edit_item: Option<ShortcutItem> = None;
 
+        let avail_w = (ui.available_width() - 12.0).max(320.0);
+        let num_cols = ((avail_w / 390.0).floor() as usize).clamp(1, 4);
+        let col_gap = 8.0_f32;
+        let col_w = ((avail_w - col_gap * (num_cols.saturating_sub(1) as f32)) / num_cols as f32)
+            .max(260.0);
+
         egui::ScrollArea::vertical()
+            .id_salt("shortcuts_scroll")
             .max_height(max_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -753,6 +880,8 @@ impl ShortcutHubApp {
                     ui.centered_and_justified(|ui| {
                         let msg = if is_hidden_tab {
                             "No hidden shortcuts. Click 'Hide' on any shortcut to remove it from your overview."
+                        } else if self.filter == CategoryFilter::Highlighted {
+                            "No pinned shortcuts yet. Click 'Pin' on any shortcut card to highlight it here."
                         } else {
                             "No shortcuts match your filter."
                         };
@@ -774,120 +903,213 @@ impl ShortcutHubApp {
                     );
                     ui.add_space(3.0);
 
-                    for item in items {
-                        egui::Frame::new()
-                            .fill(BG_CARD)
-                            .corner_radius(CornerRadius::same(7))
-                            .inner_margin(Margin::symmetric(10, 7))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    Self::render_keycaps(ui, &item.keys);
+                    for chunk in items.chunks(num_cols) {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = col_gap;
+                            for item in chunk {
+                                let card_fill = if item.highlighted {
+                                    BG_CARD_HL
+                                } else {
+                                    BG_CARD
+                                };
+                                let card_stroke = if item.highlighted {
+                                    Stroke::new(1.5, FG_YELLOW)
+                                } else {
+                                    Stroke::new(1.0, BORDER_CARD)
+                                };
 
-                                    ui.add_space(6.0);
-                                    ui.vertical(|ui| {
-                                        ui.set_max_width(
-                                            (ui.available_width() - 165.0).max(180.0),
-                                        );
-                                        ui.label(
-                                            RichText::new(&item.name)
-                                                .size(13.0)
-                                                .strong()
-                                                .color(FG_TEXT),
-                                        );
-                                        if !item.description.is_empty() {
-                                            ui.label(
-                                                RichText::new(&item.description)
-                                                    .size(11.5)
-                                                    .color(FG_MUTED),
-                                            );
-                                        }
-                                    });
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(col_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        egui::Frame::new()
+                                            .fill(card_fill)
+                                            .stroke(card_stroke)
+                                            .corner_radius(CornerRadius::same(7))
+                                            .inner_margin(Margin::symmetric(10, 7))
+                                            .show(ui, |ui| {
+                                                ui.set_width((col_w - 22.0).max(220.0));
+                                                ui.horizontal(|ui| {
+                                                    Self::render_keycaps(ui, &item.keys);
 
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if is_hidden_tab {
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("Restore")
-                                                                .size(11.5)
-                                                                .strong()
-                                                                .color(FG_DARK),
-                                                        )
-                                                        .fill(FG_GREEN)
-                                                        .corner_radius(CornerRadius::same(5)),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    restore_id = Some(item.id.clone());
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            if is_hidden_tab {
+                                                                if ui
+                                                                    .add(
+                                                                        egui::Button::new(
+                                                                            RichText::new(
+                                                                                "Restore",
+                                                                            )
+                                                                            .size(10.5)
+                                                                            .strong()
+                                                                            .color(FG_DARK),
+                                                                        )
+                                                                        .fill(FG_GREEN)
+                                                                        .corner_radius(
+                                                                            CornerRadius::same(4),
+                                                                        ),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    restore_id =
+                                                                        Some(item.id.clone());
+                                                                }
+                                                            } else {
+                                                                if ui
+                                                                    .add(
+                                                                        egui::Button::new(
+                                                                            RichText::new("Hide")
+                                                                                .size(10.5)
+                                                                                .color(FG_MUTED),
+                                                                        )
+                                                                        .fill(BG_CARD_ALT)
+                                                                        .corner_radius(
+                                                                            CornerRadius::same(4),
+                                                                        ),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    hide_id = Some(item.id.clone());
+                                                                }
+
+                                                                if item.source == "manual" {
+                                                                    if ui
+                                                                        .add(
+                                                                            egui::Button::new(
+                                                                                RichText::new(
+                                                                                    "Del",
+                                                                                )
+                                                                                .size(10.5)
+                                                                                .color(FG_RED),
+                                                                            )
+                                                                            .fill(BG_CARD_ALT)
+                                                                            .corner_radius(
+                                                                                CornerRadius::same(
+                                                                                    4,
+                                                                                ),
+                                                                            ),
+                                                                        )
+                                                                        .clicked()
+                                                                    {
+                                                                        delete_id =
+                                                                            Some(item.id.clone());
+                                                                    }
+                                                                    if ui
+                                                                        .add(
+                                                                            egui::Button::new(
+                                                                                RichText::new(
+                                                                                    "Edit",
+                                                                                )
+                                                                                .size(10.5)
+                                                                                .color(FG_TEXT),
+                                                                            )
+                                                                            .fill(BG_CARD_ALT)
+                                                                            .corner_radius(
+                                                                                CornerRadius::same(
+                                                                                    4,
+                                                                                ),
+                                                                            ),
+                                                                        )
+                                                                        .clicked()
+                                                                    {
+                                                                        edit_item =
+                                                                            Some((*item).clone());
+                                                                    }
+                                                                }
+
+                                                                let (pin_lbl, pin_fg, pin_bg) =
+                                                                    if item.highlighted {
+                                                                        (
+                                                                            "Pinned", FG_DARK,
+                                                                            FG_YELLOW,
+                                                                        )
+                                                                    } else {
+                                                                        (
+                                                                            "Pin",
+                                                                            FG_MUTED,
+                                                                            BG_CARD_ALT,
+                                                                        )
+                                                                    };
+                                                                if ui
+                                                                    .add(
+                                                                        egui::Button::new(
+                                                                            RichText::new(pin_lbl)
+                                                                                .size(10.5)
+                                                                                .strong()
+                                                                                .color(pin_fg),
+                                                                        )
+                                                                        .fill(pin_bg)
+                                                                        .corner_radius(
+                                                                            CornerRadius::same(4),
+                                                                        ),
+                                                                    )
+                                                                    .on_hover_text(
+                                                                        "Highlight this shortcut to stand out while learning",
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    toggle_hl_id =
+                                                                        Some(item.id.clone());
+                                                                }
+                                                            }
+
+                                                            let (src_lbl, src_col) =
+                                                                Self::source_badge(item);
+                                                            ui.label(
+                                                                RichText::new(src_lbl)
+                                                                    .size(10.5)
+                                                                    .strong()
+                                                                    .color(src_col),
+                                                            );
+                                                        },
+                                                    );
+                                                });
+
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new(&item.name)
+                                                        .size(12.5)
+                                                        .strong()
+                                                        .color(if item.highlighted {
+                                                            FG_YELLOW
+                                                        } else {
+                                                            FG_TEXT
+                                                        }),
+                                                );
+                                                if !item.description.is_empty() {
+                                                    ui.label(
+                                                        RichText::new(&item.description)
+                                                            .size(11.0)
+                                                            .color(FG_MUTED),
+                                                    );
                                                 }
-                                            } else {
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("Hide")
-                                                                .size(11.5)
-                                                                .color(FG_MUTED),
-                                                        )
-                                                        .fill(BG_CARD_ALT)
-                                                        .corner_radius(CornerRadius::same(5)),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    hide_id = Some(item.id.clone());
-                                                }
-
-                                                if item.source == "manual" {
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("Del")
-                                                                    .size(11.5)
-                                                                    .color(FG_RED),
-                                                            )
-                                                            .fill(BG_CARD_ALT)
-                                                            .corner_radius(CornerRadius::same(5)),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        delete_id = Some(item.id.clone());
-                                                    }
-                                                    if ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("Edit")
-                                                                    .size(11.5)
-                                                                    .color(FG_TEXT),
-                                                            )
-                                                            .fill(BG_CARD_ALT)
-                                                            .corner_radius(CornerRadius::same(5)),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        edit_item = Some((*item).clone());
-                                                    }
-                                                }
-                                            }
-
-                                            let (src_lbl, src_col) = Self::source_badge(item);
-                                            ui.add_space(6.0);
-                                            ui.label(
-                                                RichText::new(src_lbl)
-                                                    .size(11.0)
-                                                    .strong()
-                                                    .color(src_col),
-                                            );
-                                        },
-                                    );
-                                });
-                            });
-                        ui.add_space(3.0);
+                                            });
+                                    },
+                                );
+                            }
+                        });
+                        ui.add_space(5.0);
                     }
                 }
             });
 
-        if let Some(id) = hide_id {
+        if let Some(id) = toggle_hl_id {
+            if let Ok(now_hl) = toggle_highlight(&self.project_dir, &id) {
+                self.catalog = load_catalog(&self.project_dir);
+                self.status_banner = Some((
+                    if now_hl {
+                        "Shortcut pinned & highlighted".to_string()
+                    } else {
+                        "Shortcut highlight removed".to_string()
+                    },
+                    true,
+                ));
+            }
+        } else if let Some(id) = hide_id {
             if hide_item(&self.project_dir, &id).is_ok() {
                 self.trigger_sync(ctx, false, "Shortcut hidden — syncing PowerToys...");
             }
@@ -1485,6 +1707,482 @@ impl ShortcutHubApp {
         }
         self.editor = Some(modal);
     }
+
+    fn render_notes_sidebar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        sidebar_w: f32,
+        max_h: f32,
+    ) {
+        let tokens: Vec<String> = self
+            .search
+            .split_whitespace()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+
+        let mut filtered_notes: Vec<QuickNote> = self
+            .catalog
+            .quick_notes
+            .iter()
+            .filter(|note| {
+                if tokens.is_empty() {
+                    return true;
+                }
+                let hay = format!("{} {} {}", note.category, note.trigger, note.content)
+                    .to_ascii_lowercase();
+                tokens.iter().all(|tok| hay.contains(tok))
+            })
+            .cloned()
+            .collect();
+        filtered_notes.sort_by_key(|a| std::cmp::Reverse(a.pinned));
+
+        let mut copy_text: Option<String> = None;
+        let mut pin_id: Option<String> = None;
+        let mut delete_id: Option<String> = None;
+        let mut edit_note: Option<QuickNote> = None;
+        let mut open_add = false;
+
+        let inner_w = (sidebar_w - 22.0).max(240.0);
+        let notes_list_h = ((max_h - 90.0) * 0.58).max(160.0);
+        let scratch_h = (max_h - notes_list_h - 108.0).max(95.0);
+
+        egui::Frame::new()
+            .fill(BG_HEADER)
+            .stroke(Stroke::new(1.0, BORDER_CARD))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.set_min_height((max_h - 20.0).max(200.0));
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Quick Reference ({})",
+                            self.catalog.quick_notes.len()
+                        ))
+                        .size(13.5)
+                        .strong()
+                        .color(FG_PURPLE),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("+ Add Note")
+                                        .size(11.5)
+                                        .strong()
+                                        .color(FG_DARK),
+                                )
+                                .fill(FG_PURPLE)
+                                .corner_radius(CornerRadius::same(5)),
+                            )
+                            .clicked()
+                        {
+                            open_add = true;
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("quick_notes_scroll")
+                    .max_height(notes_list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if filtered_notes.is_empty() {
+                            ui.add_space(16.0);
+                            let empty_msg = if self.catalog.quick_notes.is_empty() {
+                                "Save commonly used AI /skills, prompt templates, CLI commands, or quick reminders here. Click '+ Add Note' to start."
+                            } else {
+                                "No reference notes match your current search filter."
+                            };
+                            ui.label(RichText::new(empty_msg).size(11.5).color(FG_MUTED));
+                            return;
+                        }
+
+                        for note in &filtered_notes {
+                            let fill = if note.pinned { BG_CARD_HL } else { BG_CARD };
+                            let stroke = if note.pinned {
+                                Stroke::new(1.5, FG_YELLOW)
+                            } else {
+                                Stroke::new(1.0, BORDER_CARD)
+                            };
+                            egui::Frame::new()
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(CornerRadius::same(6))
+                                .inner_margin(Margin::symmetric(9, 7))
+                                .show(ui, |ui| {
+                                    ui.set_width((inner_w - 22.0).max(210.0));
+                                    ui.horizontal(|ui| {
+                                        let cat_lbl = if note.category.is_empty() {
+                                            "NOTE".to_string()
+                                        } else {
+                                            note.category.to_ascii_uppercase()
+                                        };
+                                        ui.label(
+                                            RichText::new(cat_lbl)
+                                                .size(10.0)
+                                                .strong()
+                                                .color(if note.pinned {
+                                                    FG_YELLOW
+                                                } else {
+                                                    FG_PURPLE
+                                                }),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Del")
+                                                                .size(10.0)
+                                                                .color(FG_RED),
+                                                        )
+                                                        .fill(BG_CARD_ALT)
+                                                        .corner_radius(CornerRadius::same(4)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    delete_id = Some(note.id.clone());
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Edit")
+                                                                .size(10.0)
+                                                                .color(FG_TEXT),
+                                                        )
+                                                        .fill(BG_CARD_ALT)
+                                                        .corner_radius(CornerRadius::same(4)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    edit_note = Some(note.clone());
+                                                }
+                                                let (pin_lbl, p_fg, p_bg) = if note.pinned {
+                                                    ("Pinned", FG_DARK, FG_YELLOW)
+                                                } else {
+                                                    ("Pin", FG_MUTED, BG_CARD_ALT)
+                                                };
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new(pin_lbl)
+                                                                .size(10.0)
+                                                                .strong()
+                                                                .color(p_fg),
+                                                        )
+                                                        .fill(p_bg)
+                                                        .corner_radius(CornerRadius::same(4)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pin_id = Some(note.id.clone());
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Copy")
+                                                                .size(10.0)
+                                                                .strong()
+                                                                .color(FG_ACCENT),
+                                                        )
+                                                        .fill(BG_CARD_ALT)
+                                                        .corner_radius(CornerRadius::same(4)),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Copy command/label (or snippet if empty) to clipboard",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    let clip = if !note.trigger.trim().is_empty() {
+                                                        note.trigger.trim().to_string()
+                                                    } else {
+                                                        note.content.trim().to_string()
+                                                    };
+                                                    copy_text = Some(clip);
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    if !note.trigger.is_empty() {
+                                        ui.add_space(4.0);
+                                        egui::Frame::new()
+                                            .fill(BG_KEYCAP)
+                                            .stroke(Stroke::new(1.0, BORDER_KEYCAP))
+                                            .corner_radius(CornerRadius::same(4))
+                                            .inner_margin(Margin::symmetric(6, 2))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(&note.trigger)
+                                                        .monospace()
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(FG_TEXT),
+                                                );
+                                            });
+                                    }
+
+                                    if !note.content.is_empty() {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(&note.content)
+                                                .size(11.5)
+                                                .color(FG_MUTED),
+                                        );
+                                    }
+                                });
+                            ui.add_space(5.0);
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Scratchpad")
+                            .size(12.5)
+                            .strong()
+                            .color(FG_TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (st_txt, st_col) = if self.scratchpad_dirty_since.is_some() {
+                            ("Saving...", FG_YELLOW)
+                        } else {
+                            ("Auto-saved", FG_MUTED)
+                        };
+                        ui.label(RichText::new(st_txt).size(10.5).color(st_col));
+                    });
+                });
+                ui.add_space(4.0);
+
+                egui::Frame::new()
+                    .fill(BG_CARD_ALT)
+                    .stroke(Stroke::new(1.0, BORDER_CARD))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scratchpad_scroll")
+                            .max_height(scratch_h)
+                            .show(ui, |ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::multiline(&mut self.scratchpad)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(6)
+                                        .frame(egui::Frame::NONE)
+                                        .text_color(FG_TEXT)
+                                        .font(egui::FontId::proportional(12.0))
+                                        .hint_text(
+                                            "Jot down quick AI /skills, prompts, links, or reminders...",
+                                        ),
+                                );
+                                if resp.changed() {
+                                    self.scratchpad_dirty_since = Some(Instant::now());
+                                }
+                            });
+                    });
+            });
+
+        if open_add {
+            self.editor = None;
+            self.hotkeys_modal = None;
+            self.note_editor = Some(NoteEditorModal {
+                editing_id: None,
+                category: "AI Skills".to_string(),
+                trigger: String::new(),
+                content: String::new(),
+                error: None,
+            });
+        } else if let Some(note) = edit_note {
+            self.editor = None;
+            self.hotkeys_modal = None;
+            self.note_editor = Some(NoteEditorModal {
+                editing_id: Some(note.id),
+                category: note.category,
+                trigger: note.trigger,
+                content: note.content,
+                error: None,
+            });
+        } else if let Some(text) = copy_text {
+            ctx.copy_text(text.clone());
+            let preview: String = text.chars().take(36).collect();
+            let ellipsis = if text.chars().count() > 36 { "..." } else { "" };
+            self.status_banner = Some((format!("Copied '{preview}{ellipsis}' to clipboard"), true));
+        } else if let Some(id) = pin_id {
+            if let Ok(now_pinned) = toggle_quick_note_pin(&self.project_dir, &id) {
+                self.catalog = load_catalog(&self.project_dir);
+                self.status_banner = Some((
+                    if now_pinned {
+                        "Quick reference note pinned".to_string()
+                    } else {
+                        "Quick reference note unpinned".to_string()
+                    },
+                    true,
+                ));
+            }
+        } else if let Some(id) = delete_id {
+            if delete_quick_note(&self.project_dir, &id).is_ok() {
+                self.catalog = load_catalog(&self.project_dir);
+                self.status_banner = Some(("Reference note deleted".to_string(), true));
+            }
+        }
+    }
+
+    fn render_note_editor_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut modal) = self.note_editor.take() else {
+            return;
+        };
+
+        let mut close_modal = false;
+        let mut save_requested = false;
+        let title = if modal.editing_id.is_some() {
+            "Edit Reference Note"
+        } else {
+            "Add Quick Reference Note"
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .fade_in(false)
+            .fade_out(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(450.0, 325.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(BG_MAIN)
+                    .stroke(Stroke::new(1.5, FG_PURPLE))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Category (pick or type new):")
+                        .size(12.0)
+                        .color(FG_MUTED),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut modal.category)
+                            .text_color(FG_TEXT)
+                            .desired_width(270.0),
+                    );
+                    egui::ComboBox::from_id_salt("note_cat_pick")
+                        .selected_text("Presets")
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for preset in ["AI Skills", "Prompts", "CLI", "Links", "General"] {
+                                ui.selectable_value(
+                                    &mut modal.category,
+                                    preset.to_string(),
+                                    preset,
+                                );
+                            }
+                        });
+                });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Command / Skill / Title:")
+                        .size(12.0)
+                        .color(FG_MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut modal.trigger)
+                        .text_color(FG_TEXT)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. /promptimprover, /plan, or git stash pop"),
+                );
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Details / Prompt Snippet:")
+                        .size(12.0)
+                        .color(FG_MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut modal.content)
+                        .text_color(FG_TEXT)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4)
+                        .hint_text("Short explanation, prompt snippet, or reminder..."),
+                );
+
+                if let Some(err) = &modal.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(err).size(11.5).color(FG_RED));
+                }
+
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Save Note")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(FG_DARK),
+                            )
+                            .fill(FG_PURPLE)
+                            .corner_radius(CornerRadius::same(6)),
+                        )
+                        .clicked()
+                    {
+                        save_requested = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Cancel").size(12.5).color(FG_TEXT))
+                                .fill(BG_CARD_ALT)
+                                .corner_radius(CornerRadius::same(6)),
+                        )
+                        .clicked()
+                    {
+                        close_modal = true;
+                    }
+                });
+            });
+
+        if save_requested {
+            let res = if let Some(edit_id) = &modal.editing_id {
+                update_quick_note(
+                    &self.project_dir,
+                    edit_id,
+                    &modal.category,
+                    &modal.trigger,
+                    &modal.content,
+                )
+            } else {
+                add_quick_note(
+                    &self.project_dir,
+                    &modal.category,
+                    &modal.trigger,
+                    &modal.content,
+                )
+                .map(|_| ())
+            };
+            match res {
+                Ok(()) => {
+                    self.catalog = load_catalog(&self.project_dir);
+                    self.status_banner = Some(("Quick reference note saved".to_string(), true));
+                    return;
+                }
+                Err(e) => {
+                    modal.error = Some(e);
+                }
+            }
+        }
+
+        if !close_modal {
+            self.note_editor = Some(modal);
+        }
+    }
 }
 
 impl eframe::App for ShortcutHubApp {
@@ -1507,11 +2205,18 @@ impl eframe::App for ShortcutHubApp {
         }
 
         if self.pending_native_focus {
-            if self.focus_search_frames <= 2 {
+            if self.focus_search_frames <= 4 {
                 force_focus_window("Shortcut Hub");
                 self.pending_native_focus = false;
+            }
+            ctx.request_repaint();
+        }
+
+        if let Some(dirty_at) = self.scratchpad_dirty_since {
+            if dirty_at.elapsed() >= Duration::from_millis(400) {
+                self.flush_scratchpad();
             } else {
-                ctx.request_repaint();
+                ctx.request_repaint_after(Duration::from_millis(200));
             }
         }
 
@@ -1537,6 +2242,7 @@ impl eframe::App for ShortcutHubApp {
             if !recording && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.editor = None;
                 self.hotkeys_modal = None;
+                self.note_editor = None;
                 self.reload_live_hotkeys();
             }
         }
@@ -1560,8 +2266,31 @@ impl eframe::App for ShortcutHubApp {
                     .show(ui, |ui| {
                         self.render_search_and_chips(ui, filtered_owned.len());
                         ui.add_space(8.0);
-                        let list_h = (ui.available_height() - 34.0).max(160.0);
-                        self.render_list(ui, &ctx, &filtered_owned, list_h);
+                        let list_h = (ui.available_height() - 34.0).max(200.0);
+                        if self.show_notes_panel {
+                            let avail_w = ui.available_width();
+                            let sidebar_w = (avail_w * 0.27).clamp(320.0, 410.0);
+                            let left_w = (avail_w - sidebar_w - 12.0).max(360.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 12.0;
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(left_w, list_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        self.render_list(ui, &ctx, &filtered_owned, list_h);
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(sidebar_w, list_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        self.render_notes_sidebar(ui, &ctx, sidebar_w, list_h);
+                                    },
+                                );
+                            });
+                        } else {
+                            self.render_list(ui, &ctx, &filtered_owned, list_h);
+                        }
                     });
 
                 let footer_text = format!(
@@ -1581,6 +2310,7 @@ impl eframe::App for ShortcutHubApp {
 
         self.render_editor_modal(&ctx);
         self.render_hotkeys_modal(&ctx);
+        self.render_note_editor_modal(&ctx);
 
         if let Some(opts) = &self.screenshot {
             self.screenshot_frames += 1;

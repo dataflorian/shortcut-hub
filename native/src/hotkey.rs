@@ -975,11 +975,11 @@ pub fn spawn_global_hotkeys(
     }
 }
 
-pub fn active_monitor_centered_pos(logical_w: f32, logical_h: f32, ppp: f32) -> (f32, f32) {
+pub fn active_monitor_work_rect(ppp: f32) -> (f32, f32, f32, f32) {
     unsafe {
         let mut pt = POINT { x: 0, y: 0 };
         if GetCursorPos(&mut pt) == 0 {
-            return (200.0, 120.0);
+            return (0.0, 0.0, 1280.0, 800.0);
         }
         let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
@@ -999,17 +999,14 @@ pub fn active_monitor_centered_pos(logical_w: f32, logical_h: f32, ppp: f32) -> 
             dwFlags: 0,
         };
         if GetMonitorInfoW(hmon, &mut mi) == 0 {
-            return (200.0, 120.0);
+            return (0.0, 0.0, 1280.0, 800.0);
         }
         let scale = if ppp > 0.0 { ppp } else { 1.0 };
         let wl = mi.rcWork.left as f32 / scale;
         let wt = mi.rcWork.top as f32 / scale;
         let wr = mi.rcWork.right as f32 / scale;
         let wb = mi.rcWork.bottom as f32 / scale;
-
-        let x = (wl + (wr - wl - logical_w) * 0.5).max(wl);
-        let y = (wt + (wb - wt - logical_h) * 0.34).max(wt);
-        (x, y)
+        (wl, wt, (wr - wl).max(640.0), (wb - wt).max(480.0))
     }
 }
 

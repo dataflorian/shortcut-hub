@@ -22,10 +22,13 @@
 
 ## Features
 
-- **Instant Global Open & Close (`Ctrl+Alt+K` / `Win+F7`)** — Always-resident single-instance Windows tray daemon backed by Win32 `RegisterHotKey` (`MOD_NOREPEAT`), a `WH_KEYBOARD_LL` fallback, and focused `egui` input handling unified with an atomic 180 ms debounce guard. Press `Ctrl+Alt+K` (or `Win+F7`) from any app to open it, and press it again—or hit `Esc`—to close immediately.
+- **Instant Full-Screen Multi-Column Overview (`Ctrl+Alt+K` / `Win+F7`)** — Opens across your active monitor's full work area with responsive multi-column category grids so you can scan everything on one screen—and immediately focuses the search bar so you can start typing to filter right away. Press `Ctrl+Alt+K` (or `Win+F7`) again—or hit `Esc`—to close immediately.
+- **Pin & Highlight Learning Shortcuts** — Click **`Pin`** on any shortcut card to highlight it with a warm gold border & accent tint, or click the **`Pinned`** filter chip to focus exclusively on the shortcuts you are currently internalizing.
+- **Quick Reference & Notes Sidebar (`/skills`, Snippets & Scratchpad)** — Built-in docked right-hand reference panel for jotting down AI `/skills`, prompt templates, CLI commands, and everyday reminders. Add structured cards (**`+ Add Note`** with 1-click **`Copy`** and **`Pin`**), filter them alongside shortcuts from the main search bar, and type freely into an auto-saved **`Scratchpad`** (toggleable via **`Notes`**).
+- **Restore Windows + Undo Restore** — Un-hide default Windows shortcuts you previously hid in one click (`Restore Windows`), with an instant **`Undo Restore`** button to revert if clicked by accident.
 - **In-UI Hotkey Configuration with Live Hot-Reload** — Click **`Hotkeys`** in the header to reassign Primary and Alternate toggle shortcuts via **`Record`**, **`Clear`**, **`Reset Defaults`**, or direct text entry. Changes save to `config.local.json` and take effect immediately without restarting.
 - **Actionable Custom Hotkeys** — When adding or editing a manual shortcut via **`+ Add Shortcut`**, keep it **Reference Only** or attach a live global trigger (**`Open App / URL`** via `ShellExecuteW` or **`Run Command`** via hidden PowerShell), marked with a **`Live`** badge.
-- **GPU-Accelerated Native Rust UI** — Built with [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe) / `egui 0.37` (`glow` OpenGL backend) in a single ~6.6 MB release binary with zero Electron/WebView runtime bloat and crisp HiDPI keycap rendering.
+- **GPU-Accelerated Native Rust UI** — Built with [`eframe`](https://github.com/emilk/egui/tree/master/crates/eframe) / `egui 0.37` (`glow` OpenGL backend) in a single ~6.7 MB release binary with zero Electron/WebView runtime bloat and crisp HiDPI keycap rendering.
 - **Zero-Dependency Windows Catalog Included** — Ships with a built-in curated Windows 10/11 shortcut catalog out of the box, and automatically upgrades to the full native Windows manifest when Microsoft PowerToys is installed.
 - **Automatic Shortcut Discovery** — Scans Windows Startup `.ahk` / `.lnk` scripts, configured automation folders, enabled PowerToys modules, CopyQ global/window commands, and VS Code / Cursor / Antigravity `keybindings.json`.
 - **Two-Way PowerToys Shortcut Guide Sync** — Keeps PowerToys `+Custom.MyShortcuts.en-US.yml` and filtered `+WindowsNT.Shell.en-US.yml` synchronized (backing up your original shell manifest before first modification and rebuilding the PowerToys search index automatically).
@@ -44,12 +47,12 @@
 
 ## Performance
 
-Measured on Windows 11 (`x86_64`, `200%` DPI scale, release binary `6.6 MB` with LTO):
+Measured on Windows 11 (`x86_64`, `200%` DPI scale, release binary `6.7 MB` with LTO):
 
 | Operation | Measured Result | Notes |
 | --- | --- | --- |
-| Full catalog load (`118` items) | **`0.48 ms`** | Pure Rust YAML + JSON parser (`--bench`, 50-run avg) |
-| Multi-token search filter (`118` items) | **`31.0 µs`** | Zero heap-thrashing per keystroke (`--bench`, 1,000-run avg) |
+| Full catalog load (`118` items) | **`2.1 ms`** | Pure Rust YAML + JSON parser (`--bench`, 50-run avg) |
+| Multi-token search filter (`118` items) | **`35.0 µs`** | Zero heap-thrashing per keystroke (`--bench`, 1,000-run avg) |
 | Toggle latency | **Near-instant** | Already resident in tray; no cold process launch |
 | Idle memory & CPU | **~0% idle CPU** | Repaints on demand; Win32 event + hotkey threads sleep until signaled |
 
@@ -99,10 +102,13 @@ cd ..
 | --- | --- |
 | **`Ctrl+Alt+K`** or **`Win+F7`** | Open the overlay from any app, or **close it when open** |
 | **`Esc`** | Clear the search bar if non-empty, or close the overlay / modal |
-| **Type anywhere** | Live multi-token search across keystrokes, names, descriptions, and categories |
-| **Category chips** | One-click filter (`All`, `Custom & Auto`, custom categories, `PowerToys`, `Windows`, `Hidden / Restore`) |
+| **Type anywhere** | Live multi-token search across shortcuts, descriptions, categories, **and Quick Reference notes** (auto-focused on open) |
+| **Category chips** | One-click filter (`All`, `Pinned`, `Custom & Auto`, custom categories, `PowerToys`, `Windows`, `Hidden / Restore`) |
+| **`Pin` / `Pinned`** | Highlight any shortcut or Quick Reference note in gold to focus on what you are learning |
 | **`+ Add Shortcut`** | Create a custom shortcut (Reference Only or live **`Open App / URL`** / **`Run Command`** binding) with **`Record`** key capture |
 | **`Hotkeys`** | Reassign Primary & Alternate toggle hotkeys in-UI with live Win32 hot-reload (no restart) |
+| **`Notes` / `+ Add Note`** | Toggle Quick Reference sidebar (`/skills`, prompts, CLI snippets with 1-click **`Copy`**) and auto-saved **`Scratchpad`** |
+| **`Restore Windows` / `Undo Restore`** | Un-hide previously hidden Windows shortcuts in one click—or revert accidentally restored items right away |
 | **`Edit` / `Del` / `Hide`** | Modify manual entries or hide/restore any shortcut across Shortcut Hub, live bindings, and PowerToys |
 | **`Auto-Scan`** | Re-scan Startup, automation folders, CopyQ, VS Code/Cursor/Antigravity, and PowerToys |
 | **System tray icon** | Left-click to toggle; right-click for Toggle, Auto-Scan, Open Folder, and Quit |

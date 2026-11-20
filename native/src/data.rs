@@ -76,6 +76,19 @@ pub struct ShortcutItem {
     pub action_target: String,
     #[serde(skip)]
     pub hidden: bool,
+    #[serde(skip)]
+    pub highlighted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct QuickNote {
+    pub id: String,
+    pub category: String,
+    pub trigger: String,
+    pub content: String,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -83,6 +96,12 @@ pub struct ShortcutItem {
 pub struct UserState {
     pub manual_shortcuts: Vec<ShortcutItem>,
     pub hidden_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlighted_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quick_notes: Vec<QuickNote>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scratchpad: String,
     pub discovered_cache: Vec<ShortcutItem>,
     pub last_scan_utc: String,
 }
@@ -91,6 +110,7 @@ pub struct UserState {
 pub struct CatalogStats {
     pub active_total: usize,
     pub hidden_total: usize,
+    pub highlighted: usize,
     pub manual: usize,
     pub auto: usize,
     pub powertoys: usize,
@@ -103,6 +123,8 @@ pub struct Catalog {
     pub active: Vec<ShortcutItem>,
     pub hidden: Vec<ShortcutItem>,
     pub custom_categories: Vec<String>,
+    pub quick_notes: Vec<QuickNote>,
+    pub scratchpad: String,
     pub stats: CatalogStats,
 }
 
@@ -784,6 +806,7 @@ pub fn load_catalog(project_dir: &Path) -> Catalog {
     };
 
     let hidden_set: HashSet<String> = state.hidden_ids.iter().cloned().collect();
+    let highlighted_set: HashSet<String> = state.highlighted_ids.iter().cloned().collect();
     let mut active = Vec::with_capacity(
         state.manual_shortcuts.len() + state.discovered_cache.len() + windows.len(),
     );
@@ -803,6 +826,7 @@ pub fn load_catalog(project_dir: &Path) -> Catalog {
 
     for mut item in all_iter {
         item.hidden = hidden_set.contains(&item.id);
+        item.highlighted = highlighted_set.contains(&item.id);
         let cat = if item.category.is_empty() {
             "General".to_string()
         } else {
@@ -823,6 +847,9 @@ pub fn load_catalog(project_dir: &Path) -> Catalog {
             hidden.push(item);
         } else {
             stats.active_total += 1;
+            if item.highlighted {
+                stats.highlighted += 1;
+            }
             match item.source.as_str() {
                 "manual" => stats.manual += 1,
                 "powertoys" => stats.powertoys += 1,
@@ -837,6 +864,8 @@ pub fn load_catalog(project_dir: &Path) -> Catalog {
         active,
         hidden,
         custom_categories,
+        quick_notes: state.quick_notes,
+        scratchpad: state.scratchpad,
         stats,
     }
 }
@@ -966,7 +995,7 @@ pub fn add_manual(
         source: "manual".to_string(),
         action_type: norm_type,
         action_target: norm_target,
-        hidden: false,
+        ..Default::default()
     };
     let mut state = load_state(project_dir);
     state.manual_shortcuts.push(item.clone());
@@ -1012,6 +1041,7 @@ pub fn delete_manual(project_dir: &Path, item_id: &str) -> Result<(), String> {
     let mut state = load_state(project_dir);
     state.manual_shortcuts.retain(|x| x.id != item_id);
     state.hidden_ids.retain(|id| id != item_id);
+    state.highlighted_ids.retain(|id| id != item_id);
     save_state(project_dir, &state)
 }
 
@@ -1024,19 +1054,136 @@ pub fn hide_item(project_dir: &Path, item_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn hide_items(project_dir: &Path, item_ids: &[String]) -> Result<usize, String> {
+    let mut state = load_state(project_dir);
+    let mut added = 0usize;
+    for item_id in item_ids {
+        if !state.hidden_ids.iter().any(|x| x == item_id) {
+            state.hidden_ids.push(item_id.clone());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        save_state(project_dir, &state)?;
+    }
+    Ok(added)
+}
+
+pub fn toggle_highlight(project_dir: &Path, item_id: &str) -> Result<bool, String> {
+    let mut state = load_state(project_dir);
+    let now_highlighted = if let Some(pos) = state.highlighted_ids.iter().position(|x| x == item_id)
+    {
+        state.highlighted_ids.remove(pos);
+        false
+    } else {
+        state.highlighted_ids.push(item_id.to_string());
+        true
+    };
+    save_state(project_dir, &state)?;
+    Ok(now_highlighted)
+}
+
 pub fn restore_item(project_dir: &Path, item_id: &str) -> Result<(), String> {
     let mut state = load_state(project_dir);
     state.hidden_ids.retain(|x| x != item_id);
     save_state(project_dir, &state)
 }
 
-pub fn restore_all_windows(project_dir: &Path) -> Result<usize, String> {
+pub fn restore_all_windows(project_dir: &Path) -> Result<Vec<String>, String> {
     let mut state = load_state(project_dir);
-    let before = state.hidden_ids.len();
-    state.hidden_ids.retain(|id| !id.starts_with("win::"));
-    let restored = before - state.hidden_ids.len();
+    let restored_ids: Vec<String> = state
+        .hidden_ids
+        .iter()
+        .filter(|id| id.starts_with("win::"))
+        .cloned()
+        .collect();
+    if !restored_ids.is_empty() {
+        state.hidden_ids.retain(|id| !id.starts_with("win::"));
+        save_state(project_dir, &state)?;
+    }
+    Ok(restored_ids)
+}
+
+pub fn add_quick_note(
+    project_dir: &Path,
+    category: &str,
+    trigger: &str,
+    content: &str,
+) -> Result<QuickNote, String> {
+    let trig = trigger.trim();
+    let body = content.trim();
+    if trig.is_empty() && body.is_empty() {
+        return Err("Enter a command/label or note text.".to_string());
+    }
+    let cat = if category.trim().is_empty() {
+        "AI Skills"
+    } else {
+        category.trim()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let note = QuickNote {
+        id: format!("note::{:x}", nanos & 0xffff_ffff_ffff),
+        category: cat.to_string(),
+        trigger: trig.to_string(),
+        content: body.to_string(),
+        pinned: false,
+    };
+    let mut state = load_state(project_dir);
+    state.quick_notes.push(note.clone());
     save_state(project_dir, &state)?;
-    Ok(restored)
+    Ok(note)
+}
+
+pub fn update_quick_note(
+    project_dir: &Path,
+    note_id: &str,
+    category: &str,
+    trigger: &str,
+    content: &str,
+) -> Result<(), String> {
+    let trig = trigger.trim();
+    let body = content.trim();
+    if trig.is_empty() && body.is_empty() {
+        return Err("Enter a command/label or note text.".to_string());
+    }
+    let mut state = load_state(project_dir);
+    let Some(entry) = state.quick_notes.iter_mut().find(|n| n.id == note_id) else {
+        return Err(format!("Note '{note_id}' not found."));
+    };
+    entry.category = if category.trim().is_empty() {
+        "AI Skills".to_string()
+    } else {
+        category.trim().to_string()
+    };
+    entry.trigger = trig.to_string();
+    entry.content = body.to_string();
+    save_state(project_dir, &state)
+}
+
+pub fn delete_quick_note(project_dir: &Path, note_id: &str) -> Result<(), String> {
+    let mut state = load_state(project_dir);
+    state.quick_notes.retain(|n| n.id != note_id);
+    save_state(project_dir, &state)
+}
+
+pub fn toggle_quick_note_pin(project_dir: &Path, note_id: &str) -> Result<bool, String> {
+    let mut state = load_state(project_dir);
+    let Some(entry) = state.quick_notes.iter_mut().find(|n| n.id == note_id) else {
+        return Err(format!("Note '{note_id}' not found."));
+    };
+    entry.pinned = !entry.pinned;
+    let now_pinned = entry.pinned;
+    save_state(project_dir, &state)?;
+    Ok(now_pinned)
+}
+
+pub fn save_scratchpad(project_dir: &Path, text: &str) -> Result<(), String> {
+    let mut state = load_state(project_dir);
+    state.scratchpad = text.to_string();
+    save_state(project_dir, &state)
 }
 
 fn find_python_exe_in_dir(dir: &Path) -> Option<PathBuf> {
@@ -1349,6 +1496,100 @@ mod tests {
         assert!(cat.stats.windows >= 25);
         assert!(cat.active.iter().any(|x| x.keys == "Win+V"));
         assert!(cat.active.iter().any(|x| x.id.starts_with("win::")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_highlight_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sh_hl_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join("state"));
+        fs::write(
+            dir.join("config.json"),
+            r#"{"powertoys":{"master_shell_yml":"Z:\\missing.yml","user_shortcuts_dir":"Z:\\missing"}}"#,
+        )
+        .unwrap();
+
+        let item = add_manual(&dir, "Learn", "Ctrl+Alt+L", "Practice", "", "", "").unwrap();
+        assert!(toggle_highlight(&dir, &item.id).unwrap());
+        let cat1 = load_catalog(&dir);
+        assert_eq!(cat1.stats.highlighted, 1);
+        assert!(
+            cat1.active
+                .iter()
+                .find(|x| x.id == item.id)
+                .unwrap()
+                .highlighted
+        );
+
+        assert!(!toggle_highlight(&dir, &item.id).unwrap());
+        let cat2 = load_catalog(&dir);
+        assert_eq!(cat2.stats.highlighted, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_all_windows_and_undo_hide_items_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sh_undo_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join("state"));
+        fs::write(
+            dir.join("config.json"),
+            r#"{"powertoys":{"master_shell_yml":"Z:\\missing.yml","user_shortcuts_dir":"Z:\\missing"}}"#,
+        )
+        .unwrap();
+
+        let cat = load_catalog(&dir);
+        let win_ids: Vec<String> = cat
+            .active
+            .iter()
+            .filter(|x| x.source == "windows")
+            .take(2)
+            .map(|x| x.id.clone())
+            .collect();
+        assert_eq!(hide_items(&dir, &win_ids).unwrap(), 2);
+        assert_eq!(load_catalog(&dir).stats.windows_hidden, 2);
+
+        let restored = restore_all_windows(&dir).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(load_catalog(&dir).stats.windows_hidden, 0);
+
+        assert_eq!(hide_items(&dir, &restored).unwrap(), 2);
+        assert_eq!(load_catalog(&dir).stats.windows_hidden, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_notes_and_scratchpad_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("sh_notes_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join("state"));
+        fs::write(
+            dir.join("config.json"),
+            r#"{"powertoys":{"master_shell_yml":"Z:\\missing.yml","user_shortcuts_dir":"Z:\\missing"}}"#,
+        )
+        .unwrap();
+
+        let n = add_quick_note(&dir, "AI Skills", "/plan", "Enter step-by-step plan mode").unwrap();
+        assert!(n.id.starts_with("note::"));
+        assert!(toggle_quick_note_pin(&dir, &n.id).unwrap());
+
+        update_quick_note(
+            &dir,
+            &n.id,
+            "AI Skills",
+            "/plan",
+            "Careful architecture plan",
+        )
+        .unwrap();
+        save_scratchpad(&dir, "Remember: /grill-me before big refactors").unwrap();
+
+        let cat = load_catalog(&dir);
+        assert_eq!(cat.quick_notes.len(), 1);
+        assert_eq!(cat.quick_notes[0].trigger, "/plan");
+        assert_eq!(cat.quick_notes[0].content, "Careful architecture plan");
+        assert!(cat.quick_notes[0].pinned);
+        assert_eq!(cat.scratchpad, "Remember: /grill-me before big refactors");
+
+        delete_quick_note(&dir, &n.id).unwrap();
+        assert!(load_catalog(&dir).quick_notes.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

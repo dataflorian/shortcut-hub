@@ -156,10 +156,15 @@ fn main() -> eframe::Result<()> {
     });
 
     let start_visible = if automated { true } else { !start_hidden };
+    let init_size = if screenshot_opts.is_some() {
+        [1440.0, 900.0]
+    } else {
+        [1280.0, 800.0]
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Shortcut Hub")
-            .with_inner_size([920.0, 620.0])
+            .with_inner_size(init_size)
             .with_decorations(false)
             .with_always_on_top()
             .with_visible(start_visible)

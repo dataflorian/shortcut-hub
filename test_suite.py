@@ -344,6 +344,34 @@ Shortcuts:
         self.assertGreaterEqual(cat["stats"]["windows"], 25)
         self.assertTrue(any(x["keys"] == "Win+V" for x in cat["active"]))
 
+    def test_07_sync_preserves_highlights_quick_notes_and_scratchpad(self) -> None:
+        state = store.load_state(self.project_dir)
+        state["highlighted_ids"] = ["win::virtual_desktop::create_new_virtual_desktop::win_ctrl_d"]
+        state["quick_notes"] = [
+            {
+                "id": "note::abc1",
+                "category": "AI Skills",
+                "trigger": "/plan",
+                "content": "Design carefully before coding",
+                "pinned": True,
+            }
+        ]
+        state["scratchpad"] = "Quick reminder line"
+        store.save_state(self.project_dir, state)
+
+        store.sync_to_powertoys(
+            self.project_dir,
+            rescan=True,
+            run_indexer=False,
+            startup_dir=self.startup_dir,
+            appdata_dir=self.appdata_dir,
+            localappdata_dir=self.tmp,
+        )
+        after = store.load_state(self.project_dir)
+        self.assertEqual(after["highlighted_ids"], state["highlighted_ids"])
+        self.assertEqual(after["quick_notes"], state["quick_notes"])
+        self.assertEqual(after["scratchpad"], "Quick reminder line")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -372,6 +372,58 @@ Shortcuts:
         self.assertEqual(after["quick_notes"], state["quick_notes"])
         self.assertEqual(after["scratchpad"], "Quick reminder line")
 
+    def test_08_discovers_native_register_hotkey_and_python_js_apps(self) -> None:
+        cleanlock_dir = self.tmp / "custom_apps" / "clean-lock"
+        cleanlock_dir.mkdir(parents=True)
+        exe_path = cleanlock_dir / "CleanLock.exe"
+        exe_path.write_text("stub", encoding="utf-8")
+        (cleanlock_dir / "Program.cs").write_text(
+            """\
+internal static class NativeMethods {
+    internal const uint MOD_ALT = 0x0001;
+    internal const uint MOD_CONTROL = 0x0002;
+    internal const uint MOD_SHIFT = 0x0004;
+    internal const uint VK_L = 0x4C;
+}
+class HotkeyWindow {
+    void Init() {
+        NativeMethods.RegisterHotKey(
+            Handle,
+            0x434C,
+            NativeMethods.MOD_CONTROL | NativeMethods.MOD_ALT | NativeMethods.MOD_SHIFT,
+            NativeMethods.VK_L);
+    }
+}
+""",
+            encoding="utf-8",
+        )
+
+        py_app_dir = self.tmp / "custom_apps" / "clip-tool"
+        py_app_dir.mkdir(parents=True)
+        py_exe = py_app_dir / "ClipTool.exe"
+        py_exe.write_text("stub", encoding="utf-8")
+        (py_app_dir / "main.py").write_text(
+            "import keyboard\nkeyboard.add_hotkey('ctrl+alt+y', lambda: None)\n",
+            encoding="utf-8",
+        )
+
+        items = discovery.discover_all(
+            config={"discovery": {"scan_startup_dir": False, "scan_powertoys_manifest": False, "scan_copyq": False, "scan_vscode_keybindings": False, "scan_lnk_hotkeys": False}},
+            project_dir=self.project_dir,
+            startup_dir=self.startup_dir,
+            appdata_dir=self.appdata_dir,
+            localappdata_dir=self.tmp,
+            registry_entries=[("CleanLock", f'"{exe_path}"')],
+            running_exes=[py_exe],
+            lnk_scan_dirs=[],
+        )
+        keys = {x["keys"]: x for x in items}
+        self.assertIn("Ctrl+Alt+Shift+L", keys)
+        self.assertEqual(keys["Ctrl+Alt+Shift+L"]["category"], "CleanLock")
+        self.assertEqual(keys["Ctrl+Alt+Shift+L"]["source"], "native-hotkey")
+        self.assertIn("Ctrl+Alt+Y", keys)
+        self.assertEqual(keys["Ctrl+Alt+Y"]["category"], "ClipTool")
+
 
 if __name__ == "__main__":
     unittest.main()

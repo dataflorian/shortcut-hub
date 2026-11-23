@@ -14,6 +14,9 @@
   },
   "discovery": {
     "scan_startup_dir": true,
+    "scan_registry_run": true,
+    "scan_running_processes": true,
+    "scan_lnk_hotkeys": true,
     "extra_watch_dirs": [],
     "category_hints": {},
     "scan_powertoys_manifest": true,

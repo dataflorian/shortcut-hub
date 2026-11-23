@@ -2186,6 +2186,10 @@ impl ShortcutHubApp {
 }
 
 impl eframe::App for ShortcutHubApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_commands(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.process_commands(&ctx);

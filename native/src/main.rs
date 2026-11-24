@@ -158,6 +158,8 @@ fn main() -> eframe::Result<()> {
     let start_visible = if automated { true } else { !start_hidden };
     let init_size = if screenshot_opts.is_some() {
         [1440.0, 900.0]
+    } else if !start_visible {
+        [1.0, 1.0]
     } else {
         [1280.0, 800.0]
     };
@@ -169,6 +171,7 @@ fn main() -> eframe::Result<()> {
             .with_always_on_top()
             .with_visible(start_visible)
             .with_taskbar(false),
+        persist_window: false,
         ..Default::default()
     };
 

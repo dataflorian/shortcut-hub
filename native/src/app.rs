@@ -240,6 +240,8 @@ impl ShortcutHubApp {
             let (wx, wy, ww, wh) = active_monitor_work_rect(ctx.pixels_per_point());
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(wx, wy)));
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(ww, wh)));
+        } else if !start_visible {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
         let initial_filter = screenshot
@@ -2188,6 +2190,13 @@ impl ShortcutHubApp {
 impl eframe::App for ShortcutHubApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_commands(ctx);
+        if !self.visible
+            && !self.smoke_test
+            && self.screenshot.is_none()
+            && ctx.input(|i| i.viewport().visible()) == Some(true)
+        {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2252,6 +2261,7 @@ impl eframe::App for ShortcutHubApp {
         }
 
         if !self.visible && !self.smoke_test && self.screenshot.is_none() {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             return;
         }
 
